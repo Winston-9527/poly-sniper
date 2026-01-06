@@ -55,7 +55,7 @@ export class GammaClient {
      */
     async getMarketMetadataByTokenId(tokenId: string): Promise<{ id: string, conditionId: string } | null> {
         try {
-            const url = `${this.baseUrl}/markets?clob_token_ids_contains=${tokenId}`;
+            const url = `${this.baseUrl}/markets?clob_token_ids=${tokenId}`;
             const response = await fetch(url, { dispatcher: this.dispatcher });
             if (!response.ok) return null;
 
