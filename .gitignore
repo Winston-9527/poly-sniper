@@ -1,0 +1,27 @@
+# Dependencies
+node_modules
+.pnp
+.pnp.js
+
+# Testing
+coverage
+
+# Production
+dist
+dist-real
+
+# Misc
+.DS_Store
+.env
+.npmrc
+*.log
+
+# Debug
+debug.js
+temp_*.json
+*.tmp
+initialplan.md
+test-*.ts
+testholders.py
+find-token-id*.cjs
+find-token-id*.ts

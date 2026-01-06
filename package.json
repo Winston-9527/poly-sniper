@@ -1,0 +1,24 @@
+{
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "node --loader ts-node/esm src/index.ts",
+    "monitor-btc": "node --loader ts-node/esm src/btc-monitor.ts"
+  },
+  "dependencies": {
+    "@polymarket/clob-client": "^5.1.3",
+    "axios": "^1.13.2",
+    "dotenv": "^17.2.3",
+    "ethers": "^6.16.0",
+    "https-proxy-agent": "^7.0.6",
+    "node-telegram-bot-api": "^0.67.0",
+    "undici": "^7.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "@types/node-telegram-bot-api": "^0.64.13",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
