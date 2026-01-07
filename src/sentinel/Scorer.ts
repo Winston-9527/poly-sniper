@@ -32,16 +32,16 @@ export class Scorer {
             const ageHours = (nowSeconds - profile.firstSeenTimestamp) / 3600;
 
             if (ageHours < 24) {
-                freshnessScore = 30;
+                freshnessScore = 40;
                 details.push(`Brand New (<24h)`);
             } else if (ageHours < 48) {
-                freshnessScore = 20;
+                freshnessScore = 30;
                 details.push(`Very New (<48h)`);
             } else if (ageHours < 168) { // 1 week
-                freshnessScore = 10;
+                freshnessScore = 20;
                 details.push(`New (<1w)`);
             } else if (ageHours < 720) { // 30 days
-                freshnessScore = 5;
+                freshnessScore = 10;
                 details.push(`Recent (<1mo)`);
             }
             // > 1 month gets 0 freshness score

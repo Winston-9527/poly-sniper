@@ -4,6 +4,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "node --loader ts-node/esm src/index.ts",
+    "test:manual": "node test-manual-command.js",
     "monitor-btc": "node --loader ts-node/esm src/btc-monitor.ts"
   },
   "dependencies": {

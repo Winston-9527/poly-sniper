@@ -52,12 +52,14 @@ export class Sentinel {
         // 修复 AnomalyDetector 初始化：阈值 0.05 (5%), 窗口 5 分钟
         this.detector = new AnomalyDetector(0.05, 5);
         this.filter = new MarketFilter();
-        this.messenger = new TelegramMessenger();
 
         const gamma = new GammaClient();
         const analyzer = new ChainAnalyzer(process.env.POLYGON_RPC_URL);
         const scorer = new Scorer();
         this.profiler = new Profiler(gamma, analyzer, scorer);
+
+        // Messenger 需要 Profiler 以支持手动分析指令
+        this.messenger = new TelegramMessenger(this.profiler);
     }
 
     async start() {
@@ -446,10 +448,13 @@ export class Sentinel {
             const suspiciousWallets = await this.profiler.analyzeMarket(anomaly.marketId, metadata.conditionId, anomaly.currentPrice);
             console.log(`[Sentinel] 画像分析完成，找到 ${suspiciousWallets.length} 个高疑钱包`);
 
-            // 3. 如果有高疑钱包，发送补充分析报告
+            // 3. 发送画像分析结果（无论有无发现，都给一个反馈，形成闭环）
             if (suspiciousWallets.length > 0) {
                 await this.messenger.sendProfilerReport(metadata, suspiciousWallets);
                 console.log(`[Sentinel] 画像报告已发送`);
+            } else {
+                // 如果是自动监控触发的异动，但没发现问题，发个简短的平安报
+                await this.messenger.sendSafeReport(metadata);
             }
         } catch (error) {
             console.error(`[Sentinel] 处理异动失败:`, error);

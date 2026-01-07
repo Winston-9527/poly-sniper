@@ -73,6 +73,51 @@ export class GammaClient {
     }
 
     /**
+     * 根据 Slug 查找市场元数据
+     */
+    async getMarketMetadataBySlug(slug: string): Promise<{ id: string, conditionId: string, title: string, tokenIds: string[] } | null> {
+        try {
+            // 1. 尝试作为 Event Slug 查询
+            const eventUrl = `${this.baseUrl}/events?slug=${slug}`;
+            const response = await fetch(eventUrl, { dispatcher: this.dispatcher });
+
+            if (response.ok) {
+                const data = await response.json() as any[];
+                if (data.length > 0 && data[0].markets && data[0].markets.length > 0) {
+                    // 通常取第一个市场作为主市场
+                    const market = data[0].markets[0];
+                    return {
+                        id: market.id,
+                        conditionId: market.conditionId,
+                        title: market.question,
+                        tokenIds: JSON.parse(market.clobTokenIds || "[]")
+                    };
+                }
+            }
+
+            // 2. 尝试作为 Market Slug 查询
+            const marketUrl = `${this.baseUrl}/markets?slug=${slug}`;
+            const mResponse = await fetch(marketUrl, { dispatcher: this.dispatcher });
+            if (mResponse.ok) {
+                const mData = await mResponse.json() as any[];
+                if (mData.length > 0) {
+                    return {
+                        id: mData[0].id,
+                        conditionId: mData[0].conditionId,
+                        title: mData[0].question,
+                        tokenIds: JSON.parse(mData[0].clobTokenIds || "[]")
+                    };
+                }
+            }
+
+            return null;
+        } catch (error) {
+            console.error("[GammaClient] Failed to resolve slug:", error);
+            return null;
+        }
+    }
+
+    /**
      * 获取用户的最近活动 (用于修正交易次数和市场专注度)
      * @param address 钱包地址
      * @param limit 获取的条目数 (默认 50，足以判断活跃度)
