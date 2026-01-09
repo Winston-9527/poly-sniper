@@ -1,0 +1,106 @@
+# Poly-sniper
+
+<div align="center">
+  <img src="visual-asset/logo.png" alt="Poly-sniper Logo" width="200"/>
+</div>
+
+Poly-sniper 是一个针对 Polymarket 的全市场追踪与异动监测分析工具。它能够实时监控市场动态，发现资金异动，并提供深入的钱包分析功能，旨在帮助用户捕捉市场机会并识别潜在的内幕交易行为。
+
+## 🚀 主要功能 (Features)
+
+1.  **全市场追踪 (Total Market Tracking)**
+    *   实时追踪和监控 Polymarket 上的所有预测市场，不错过任何重要动态。
+
+2.  **市场异动自动报警 (Anomaly Detection & Alerts)**
+    *   通过智能算法监测市场资金流向和赔率变化。
+    *   当检测到异常波动或大额资金介入时，系统会自动触发报警，并立即进行初步的画像分析。
+
+    ![市场异动自动报警示例](visual-asset/auto.png)
+    *^ 系统自动捕捉异动并推送包含价格变动、市场链接及初步分析的警报。*
+
+3.  **可疑内幕钱包分析 (Suspicious Wallet Analysis)**
+    *   **自动分析**: 针对捕捉到的异动事件，自动关联并分析相关参与钱包的交易历史和行为模式。
+    *   **手动分析 (`/check`)**: 支持通过指令手动查询特定钱包或市场，深度挖掘潜在的内幕交易线索。
+
+    ![手动分析指令示例](visual-asset/mannually.png)
+    *^ 用户可随时发送 `/check` 指令对特定市场进行深度扫描，获取嫌疑钱包评分与特征。*
+
+4.  **Telegram 自动推送 (Telegram Notification)**
+    *   集成 Telegram Bot， 将市场异动警报、分析报告实时推送到你的 Telegram 频道或群组，让你随时随地掌握第一手信息。
+
+## 🛠 环境配置 (Configuration)
+
+### 1. 环境依赖 (Prerequisites)
+
+*   [Node.js](https://nodejs.org/) (建议 v18 或更高版本)
+*   npm (Node.js 自带)
+
+### 2. 安装 (Installation)
+
+```bash
+git clone https://github.com/Winston-9527/poly-sniper.git
+cd poly-sniper
+npm install
+```
+
+### 3. 每个环境需要配置变量 (.env)
+
+在项目根目录下创建一个 `.env` 文件，并填入以下配置信息：
+
+```env
+# Telegram Bot 配置 (用于接收报警推送)
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+TELEGRAM_CHAT_ID=your_telegram_chat_id
+
+# 区块链与网络配置
+# Polygon RPC 节点地址 (用于链上数据分析)
+POLYGON_RPC_URL=https://polygon-rpc.com
+# 或者使用通用的 RPC_URL
+RPC_URL=https://polygon-rpc.com
+
+# (可选) 代理配置 - 如果你的网络环境需要代理才能访问 Polymarket 或 Telegram API
+HTTPS_PROXY=http://127.0.0.1:7890
+HTTP_PROXY=http://127.0.0.1:7890
+```
+
+*   **获取 Telegram Token**: 在 Telegram 中联系 [@BotFather](https://t.me/BotFather) 创建新机器人获取 Token。
+*   **获取 Chat ID**: 将你的机器人拉入群组，或直接私聊，通过相关工具或 API 获取 Chat ID。
+
+## 🚀 使用指南 (Usage)
+
+### 启动监控 (Start Monitoring)
+
+**开发模式:**
+```bash
+npm run dev
+```
+
+**生产模式:**
+1. 编译代码:
+    ```bash
+    npm run build
+    ```
+2. 启动:
+    ```bash
+    npm start
+    ```
+
+### 常用指令
+
+在 Telegram 中与机器人交互 (需确保服务已启动):
+*   `/check <参数>`: 手动触发对特定目标的分析 (具体参数格式请参考内部文档或代码)。
+
+## 🗺️ 发展路线图 (Roadmap)
+
+我们致力于持续优化 Poly-sniper 的智能化程度：
+
+- [ ] **大模型深度分析**: 接入 LLM (大语言模型) 辅助钱包行为分析，提供更自然、更深度的内幕交易嫌疑报告。
+- [ ] **智能阈值优化**: 根据市场资金沉淀量 (Volume/Liquidity) 动态调整异动报警的权重和阈值，减少误报，提高信号准确度。
+
+## 🤝 贡献 (Contributing)
+
+欢迎提交 Issue 或 Pull Request！
+
+## 📄 许可证 (License)
+
+[MIT License](LICENSE)

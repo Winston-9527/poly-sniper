@@ -25,3 +25,7 @@ test-*.ts
 testholders.py
 find-token-id*.cjs
 find-token-id*.ts
+test-*.js
+test-*.json
+openspec/
+data/
