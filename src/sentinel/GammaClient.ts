@@ -1,10 +1,18 @@
 import { fetch, ProxyAgent } from 'undici';
 import { Holder, UserActivity } from './types.js';
+import { isHighPriorityActive } from "../workflow/analysisRunner.js";
 
 export class GammaClient {
     private baseUrl = "https://gamma-api.polymarket.com";
     private dataApiUrl = "https://data-api.polymarket.com";
     private dispatcher: any;
+    private readonly holdersCache = new Map<string, { data: Holder[]; expiresAt: number }>();
+    private readonly activityCache = new Map<string, { data: UserActivity[]; expiresAt: number }>();
+    private readonly holdersCacheTtl = Number(process.env.DATA_API_HOLDERS_CACHE_TTL_MS || 300000);
+    private readonly activityCacheTtl = Number(process.env.DATA_API_ACTIVITY_CACHE_TTL_MS || 120000);
+    private dataApiInFlight = 0;
+    private readonly dataApiConcurrencyLimit = Number(process.env.DATA_API_CONCURRENCY_LIMIT || 2);
+    private readonly dataApiPriorityConcurrencyLimit = Number(process.env.DATA_API_PRIORITY_CONCURRENCY_LIMIT || 1);
 
     constructor() {
         const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY;
@@ -21,39 +29,80 @@ export class GammaClient {
      * @param limit 获取前多少名
      */
     async getTopHolders(conditionId: string, tokenId: string, limit: number = 20): Promise<Holder[]> {
-        try {
-            // 使用新的 Data API 获取持仓
-            const url = `${this.dataApiUrl}/holders?market=${conditionId}&limit=${limit}`;
-            console.log(`[GammaClient] 正在请求: ${url}`);
-            const response = await fetch(url, { dispatcher: this.dispatcher });
-            if (!response.ok) {
-                console.error(`[GammaClient] Data API 错误: ${response.status} ${response.statusText}`);
-                return [];
-            }
-
-            const data = await response.json() as any[];
-            console.log(`[GammaClient] 收到数据，长度: ${data.length}`);
-            // 找到对应 tokenId 的持仓数据
-            const tokenData = data.find(item => item.token === tokenId);
-            if (!tokenData || !tokenData.holders) {
-                console.log(`[GammaClient] 未找到 Token ID ${tokenId} 的持仓数据`);
-                return [];
-            }
-
-            return tokenData.holders.map((item: any) => ({
-                address: item.proxyWallet || item.userAddress,
-                balance: parseFloat(item.amount)
-            }));
-        } catch (error) {
-            console.error(`[GammaClient] 获取持仓者失败:`, error);
-            return [];
+        const cacheKey = `${conditionId}:${tokenId}:${limit}`;
+        const cached = this.holdersCache.get(cacheKey);
+        if (cached && cached.expiresAt > Date.now()) {
+            return cached.data;
         }
+
+        const url = `${this.dataApiUrl}/holders?market=${conditionId}&limit=${limit}`;
+        const maxAttempts = 3;
+
+        await this.waitForDataApiSlot();
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            try {
+                console.log(`[GammaClient] 正在请求: ${url}`);
+                const response = await fetch(url, { dispatcher: this.dispatcher });
+                if (!response.ok) {
+                    console.error(`[GammaClient] Data API 错误: ${response.status} ${response.statusText}`);
+                    if (attempt < maxAttempts) {
+                        await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+                        continue;
+                    }
+                    return [];
+                }
+
+                const data = await response.json() as any[];
+                console.log(`[GammaClient] 收到数据，长度: ${data.length}`);
+                const tokenData = data.find(item => item.token === tokenId);
+                if (!tokenData || !tokenData.holders) {
+                    console.log(`[GammaClient] 未找到 Token ID ${tokenId} 的持仓数据`);
+                    return [];
+                }
+
+                const holders = tokenData.holders.map((item: any) => ({
+                    address: item.proxyWallet || item.userAddress,
+                    balance: parseFloat(item.amount)
+                }));
+                this.holdersCache.set(cacheKey, { data: holders, expiresAt: Date.now() + this.holdersCacheTtl });
+                return holders;
+            } catch (error) {
+                console.error(`[GammaClient] 获取持仓者失败 (尝试 ${attempt}/${maxAttempts}):`, error);
+                if (attempt < maxAttempts) {
+                    await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+                    continue;
+                }
+                return [];
+            } finally {
+                this.releaseDataApiSlot();
+            }
+        }
+
+        return [];
+    }
+
+    private async waitForDataApiSlot() {
+        const maxWaitMs = Number(process.env.DATA_API_QUEUE_TIMEOUT_MS || 8000);
+        const start = Date.now();
+        const limit = isHighPriorityActive() ? this.dataApiPriorityConcurrencyLimit : this.dataApiConcurrencyLimit;
+        while (this.dataApiInFlight >= limit) {
+            if (Date.now() - start > maxWaitMs) {
+                console.warn("[GammaClient] Data API 排队超时，继续尝试");
+                break;
+            }
+            await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        this.dataApiInFlight += 1;
+    }
+
+    private releaseDataApiSlot() {
+        this.dataApiInFlight = Math.max(0, this.dataApiInFlight - 1);
     }
 
     /**
      * 根据 Token ID 查找对应的市场元数据
      */
-    async getMarketMetadataByTokenId(tokenId: string): Promise<{ id: string, conditionId: string } | null> {
+    async getMarketMetadataByTokenId(tokenId: string): Promise<{ id: string, conditionId: string, title?: string, slug?: string, liquidity?: number, tvl?: number, volume?: number } | null> {
         try {
             const url = `${this.baseUrl}/markets?clob_token_ids=${tokenId}`;
             const response = await fetch(url, { dispatcher: this.dispatcher });
@@ -61,9 +110,30 @@ export class GammaClient {
 
             const data = await response.json() as any[];
             if (data.length > 0) {
+                const market = data[0];
+                const marketLiquidity = market.liquidityNum ?? (market.liquidity ? parseFloat(market.liquidity) : undefined);
+                let tvl = marketLiquidity;
+                let volume = market.volumeNum ?? (market.volume ? parseFloat(market.volume) : undefined);
+                let resolvedLiquidity = marketLiquidity;
+
+                if (market.slug) {
+                    const [eventMetrics, marketMetrics] = await Promise.all([
+                        this.getEventMetricsBySlug(market.slug),
+                        this.getMarketMetricsBySlug(market.slug)
+                    ]);
+                    resolvedLiquidity = marketMetrics?.liquidity ?? marketLiquidity;
+                    tvl = resolvedLiquidity ?? eventMetrics?.liquidity ?? tvl;
+                    volume = marketMetrics?.volume ?? eventMetrics?.volume ?? volume;
+                }
+
                 return {
-                    id: data[0].id,
-                    conditionId: data[0].conditionId
+                    id: market.id,
+                    conditionId: market.conditionId,
+                    title: market.question,
+                    slug: market.slug,
+                    liquidity: resolvedLiquidity,
+                    tvl,
+                    volume
                 };
             }
             return null;
@@ -72,10 +142,46 @@ export class GammaClient {
         }
     }
 
+    private async getEventMetricsBySlug(slug: string): Promise<{ liquidity?: number; volume?: number } | null> {
+        try {
+            const eventUrl = `https://polymarket.com/api/event?slug=${slug}`;
+            const response = await fetch(eventUrl, { dispatcher: this.dispatcher });
+            if (!response.ok) {
+                return null;
+            }
+            const data = await response.json() as any;
+            const liquidity = Number.isFinite(data?.liquidity) ? data.liquidity : undefined;
+            const volume = Number.isFinite(data?.volume) ? data.volume : undefined;
+            return { liquidity, volume };
+        } catch {
+            return null;
+        }
+    }
+
+    private async getMarketMetricsBySlug(slug: string): Promise<{ liquidity?: number; volume?: number } | null> {
+        try {
+            const marketUrl = `https://polymarket.com/api/market?slug=${slug}`;
+            const response = await fetch(marketUrl, { dispatcher: this.dispatcher });
+            if (!response.ok) {
+                return null;
+            }
+            const data = await response.json() as any;
+            const liquidity = Number.isFinite(data?.liquidityNum)
+                ? data.liquidityNum
+                : (data?.liquidity ? parseFloat(data.liquidity) : undefined);
+            const volume = Number.isFinite(data?.volumeNum)
+                ? data.volumeNum
+                : (data?.volume ? parseFloat(data.volume) : undefined);
+            return { liquidity, volume };
+        } catch {
+            return null;
+        }
+    }
+
     /**
      * 根据 Slug 查找市场元数据
      */
-    async getMarketMetadataBySlug(slug: string): Promise<{ id: string, conditionId: string, title: string, tokenIds: string[] } | null> {
+    async getMarketMetadataBySlug(slug: string): Promise<{ id: string, conditionId: string, title: string, tokenIds: string[], liquidity?: number, tvl?: number, volume?: number } | null> {
         try {
             // 1. 尝试作为 Event Slug 查询
             const eventUrl = `${this.baseUrl}/events?slug=${slug}`;
@@ -86,11 +192,16 @@ export class GammaClient {
                 if (data.length > 0 && data[0].markets && data[0].markets.length > 0) {
                     // 通常取第一个市场作为主市场
                     const market = data[0].markets[0];
+                    const eventLiquidity = Number.isFinite(data[0].liquidity) ? data[0].liquidity : undefined;
+                    const eventVolume = Number.isFinite(data[0].volume) ? data[0].volume : undefined;
                     return {
                         id: market.id,
                         conditionId: market.conditionId,
                         title: market.question,
-                        tokenIds: JSON.parse(market.clobTokenIds || "[]")
+                        tokenIds: JSON.parse(market.clobTokenIds || "[]"),
+                        liquidity: Number.isFinite(market.liquidity) ? market.liquidity : undefined,
+                        tvl: eventLiquidity,
+                        volume: eventVolume
                     };
                 }
             }
@@ -101,11 +212,21 @@ export class GammaClient {
             if (mResponse.ok) {
                 const mData = await mResponse.json() as any[];
                 if (mData.length > 0) {
+                    const [eventMetrics, marketMetrics] = await Promise.all([
+                        this.getEventMetricsBySlug(slug),
+                        this.getMarketMetricsBySlug(slug)
+                    ]);
+                    const liquidity = mData[0].liquidityNum ?? (mData[0].liquidity ? parseFloat(mData[0].liquidity) : undefined);
+                    const resolvedLiquidity = marketMetrics?.liquidity ?? liquidity;
+                    const resolvedVolume = marketMetrics?.volume ?? eventMetrics?.volume ?? (mData[0].volumeNum ?? (mData[0].volume ? parseFloat(mData[0].volume) : undefined));
                     return {
                         id: mData[0].id,
                         conditionId: mData[0].conditionId,
                         title: mData[0].question,
-                        tokenIds: JSON.parse(mData[0].clobTokenIds || "[]")
+                        tokenIds: JSON.parse(mData[0].clobTokenIds || "[]"),
+                        liquidity: resolvedLiquidity,
+                        tvl: resolvedLiquidity ?? eventMetrics?.liquidity ?? liquidity,
+                        volume: resolvedVolume
                     };
                 }
             }
@@ -123,6 +244,13 @@ export class GammaClient {
      * @param limit 获取的条目数 (默认 50，足以判断活跃度)
      */
     async getUserActivity(address: string, limit: number = 50): Promise<UserActivity[]> {
+        const cacheKey = `${address}:${limit}`;
+        const cached = this.activityCache.get(cacheKey);
+        if (cached && cached.expiresAt > Date.now()) {
+            return cached.data;
+        }
+
+        await this.waitForDataApiSlot();
         try {
             const url = `${this.dataApiUrl}/activity?user=${address}&limit=${limit}`;
             const response = await fetch(url, { dispatcher: this.dispatcher });
@@ -134,7 +262,7 @@ export class GammaClient {
 
             // Data API 返回的是直接的数组
             const data = await response.json() as any[];
-            return data.map(item => ({
+            const activities = data.map(item => ({
                 timestamp: item.timestamp,
                 type: item.type,
                 slug: item.slug,
@@ -145,9 +273,13 @@ export class GammaClient {
                 size: item.size,
                 usdcSize: item.usdcSize
             }));
+            this.activityCache.set(cacheKey, { data: activities, expiresAt: Date.now() + this.activityCacheTtl });
+            return activities;
         } catch (error) {
             console.warn(`[GammaClient] 获取用户活动失败 ${address}:`, error);
             return [];
+        } finally {
+            this.releaseDataApiSlot();
         }
     }
 }

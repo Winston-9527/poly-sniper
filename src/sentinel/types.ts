@@ -18,7 +18,9 @@ export interface MarketMetadata {
     slug?: string;
     outcome?: string;
     conditionId?: string;
-    liquidity?: number; // 新增：流动性
+    liquidity?: number; // 流动性（Gamma/Polymarket market liquidity）
+    tvl?: number; // 事件级 TVL/Volume（来自 Polymarket event API）
+    volume?: number; // 市场累计成交额
 }
 
 export interface UserActivity {
@@ -62,5 +64,13 @@ export interface ScoreResult {
         capital: number;    // 10%
     };
     details: string[];
+}
+
+export interface AnomalyWebhookPayload {
+    eventType: "market.anomaly";
+    detectedAt: number;
+    anomaly: Anomaly;
+    market: MarketMetadata;
+    source: "sentinel";
 }
 

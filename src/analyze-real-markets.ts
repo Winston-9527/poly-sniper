@@ -51,7 +51,7 @@ async function run() {
                 conditionId: infinexConditionId,
                 liquidity: 61519
             };
-            await messenger.sendProfilerReport(meta1, results1);
+            await messenger.sendLlmReport(meta1, "[已迁移到 LLM 分析，请使用 /check 或 Sentinel 触发查看结论] ");
         }
     } catch (err: any) {
         console.error("Error analyzing Infinex:", err.message || err);
@@ -83,7 +83,7 @@ async function run() {
                 conditionId: khameneiConditionId,
                 liquidity: 272254
             };
-            await messenger.sendProfilerReport(meta2, results2);
+            await messenger.sendLlmReport(meta2, "[已迁移到 LLM 分析，请使用 /check 或 Sentinel 触发查看结论] ");
         }
     } catch (err: any) {
         console.error("Error analyzing Khamenei:", err.message || err);

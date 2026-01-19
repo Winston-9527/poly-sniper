@@ -90,6 +90,54 @@ npm run dev
 在 Telegram 中与机器人交互 (需确保服务已启动):
 *   `/check <参数>`: 手动触发对特定目标的分析 (具体参数格式请参考内部文档或代码)。
 
+### MCP 工作流节点 (MCP Node)
+
+用于在 Agent Workflow 中作为独立节点运行，提供异动事件的标准化接口。
+
+**启动 MCP 服务**
+```bash
+MCP_AUTO_START=true MCP_PORT=8788 node --loader ts-node/esm src/mcp/server.ts
+```
+
+**测试 MCP 接口**
+```bash
+npm run test:mcp
+```
+
+**Webhook 推送地址**
+- `LANGGRAPH_WEBHOOK_URL`: 当 Sentinel 检测到异动时，将异动事件推送到该地址。
+
+### LangGraph 工作流示例
+
+项目内提供最小 LangGraph 工作流脚本，串联 MCP 异动数据与 LLM 分析。
+
+**运行集成测试**
+```bash
+npm run test:workflow
+```
+
+**解析真实市场参数**
+```bash
+E2E_MARKET_SLUG="<slug>" npm run test:e2e:resolve
+# 或者
+E2E_MARKET_ID="<tokenId>" npm run test:e2e:resolve
+```
+
+**生产端到端测试**
+```bash
+E2E_MARKET_ID="<tokenId>" E2E_CONDITION_ID="<conditionId>" npm run test:e2e:prod
+```
+
+**环境变量**
+- `OPENAI_API_KEY`: LLM API Key（生产环境必须配置）
+- `OPENAI_MODEL`: 模型名称，默认 `gpt-4o-mini`
+- `OPENAI_BASE_URL`: 兼容 OpenAI 的第三方接口地址（如 OpenRouter、Gemini）
+- `PROFILER_API_URL`: 钱包画像服务地址（真实画像必填）
+- `PROFILER_AUTO_START`: 是否自动启动 Profiler 服务
+- `PROFILER_PORT`: Profiler 服务端口
+- `WORKFLOW_USE_MOCK_LLM`: 测试时可设为 `true`
+- `WORKFLOW_USE_MOCK_WALLETS`: 测试时跳过真实钱包画像
+
 ## 🗺️ 发展路线图 (Roadmap)
 
 我们致力于持续优化 Poly-sniper 的智能化程度：

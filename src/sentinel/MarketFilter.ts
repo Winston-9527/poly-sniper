@@ -43,7 +43,8 @@ export class MarketFilter {
         // 4. 流动性过滤
         // 如果流动性数据存在 (>=0) 且小于 $10,000，则排除
         // 注意：有些市场可能暂时没有流动性数据（-1），我们选择暂时保留，观察价格变动是否有意义
-        if (metadata.liquidity !== undefined && metadata.liquidity >= 0 && metadata.liquidity < 10000) {
+        const liquidity = metadata.liquidity ?? metadata.tvl;
+        if (liquidity !== undefined && liquidity >= 0 && liquidity < 10000) {
             return false;
         }
 

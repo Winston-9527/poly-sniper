@@ -78,7 +78,7 @@ async function main() {
             // Try to send real message if configured
             if ((messenger as any).bot) {
                 console.log("Attempting to send to real Telegram...");
-                await messenger.sendProfilerReport(metadata, suspiciousWallets);
+                await messenger.sendLlmReport(metadata, "[已迁移到 LLM 分析，请使用 /check 或 Sentinel 触发查看结论]");
             } else {
                 console.log("Telegram credentials not found. Skipping real send.");
             }

@@ -9,7 +9,8 @@ import { Profiler } from './Profiler.js';
 import { GammaClient } from './GammaClient.js';
 import { ChainAnalyzer } from './ChainAnalyzer.js';
 import { Scorer } from './Scorer.js';
-import { MarketUpdate } from './types.js';
+import { AnomalyWebhookPayload, MarketUpdate } from './types.js';
+import { shouldUseRemoteProfiler, withHighPriority, isHighPriorityActive } from "../workflow/analysisRunner.js";
 
 // 检查代理设置
 const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY;
@@ -38,6 +39,15 @@ export class Sentinel {
     private refreshInterval: NodeJS.Timeout | null = null;
     private messageCount: number = 0;
     private readonly csvPath = path.join(process.cwd(), 'data', 'markets.csv');
+    private readonly webhookUrl = process.env.LANGGRAPH_WEBHOOK_URL || "";
+    private readonly analysisQueue: Array<{ anomaly: any; metadata: any }> = [];
+    private analysisRunning = false;
+    private readonly analysisCooldownMs = Number(process.env.ANALYSIS_COOLDOWN_MS || 1500);
+    private readonly analysisQueueLimit = Number(process.env.ANALYSIS_QUEUE_LIMIT || 3);
+    private readonly pollingIntervalMs = Number(process.env.POLLING_INTERVAL_MS || 15000);
+    private readonly pollingConcurrencyLimit = Number(process.env.POLLING_CONCURRENCY_LIMIT || 4);
+    private pollingInFlight = 0;
+    private readonly highPriorityPollingIntervalMs = Number(process.env.HIGH_PRIORITY_POLLING_INTERVAL_MS || 30000);
 
     constructor(configOrUrl: string | SentinelConfig = "https://clob.polymarket.com", manualTokenIds: string[] = []) {
         let url = "https://clob.polymarket.com";
@@ -229,15 +239,19 @@ export class Sentinel {
                         const liquidity = market.liquidity ? parseFloat(market.liquidity) : -1;
 
                         tokenIds.forEach((tokenId: string, index: number) => {
-                            this.marketMetadataMap.set(tokenId, {
-                                title: market.question,
-                                marketId: tokenId,
-                                category: category,
-                                slug: slug,
-                                outcome: outcomes[index] || "",
-                                conditionId: market.conditionId,
-                                liquidity: liquidity
-                            });
+                        const volume = market.volumeNum ?? (market.volume ? parseFloat(market.volume) : undefined);
+                        this.marketMetadataMap.set(tokenId, {
+                            title: market.question,
+                            marketId: tokenId,
+                            category: category,
+                            slug: slug,
+                            outcome: outcomes[index] || "",
+                            conditionId: market.conditionId,
+                            liquidity: liquidity,
+                            tvl: liquidity,
+                            volume
+                        });
+
                         });
                     }
 
@@ -274,6 +288,8 @@ export class Sentinel {
                                 const outcomes = JSON.parse(market.outcomes || "[]");
                                 if (tokenIds.includes(id)) {
                                     const index = tokenIds.indexOf(id);
+                                    const marketLiquidity = market.liquidity ? parseFloat(market.liquidity) : -1;
+                                    const marketVolume = market.volumeNum ?? (market.volume ? parseFloat(market.volume) : undefined);
                                     this.marketMetadataMap.set(id, {
                                         title: market.question,
                                         marketId: id,
@@ -281,8 +297,11 @@ export class Sentinel {
                                         slug: market.slug || "",
                                         outcome: outcomes[index] || "",
                                         conditionId: market.conditionId,
-                                        liquidity: market.liquidity ? parseFloat(market.liquidity) : -1
+                                        liquidity: marketLiquidity,
+                                        tvl: marketLiquidity > 0 ? marketLiquidity : undefined,
+                                        volume: marketVolume
                                     });
+
                                 }
                             }
                         }
@@ -301,16 +320,22 @@ export class Sentinel {
 
     private async lazyFetchMetadata(tokenId: string) {
         try {
-            const response = await fetch(`https://gamma-api.polymarket.com/markets?clob_token_ids=${tokenId}`, {
+            const response = await fetch(`https://clob.polymarket.com/ticker?token_id=${tokenId}`, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                },
                 dispatcher: globalProxyAgent
             });
+
             if (response.ok) {
-                const markets: any = await response.json();
-                if (Array.isArray(markets) && markets.length > 0) {
-                    const market = markets[0];
+                const data: any = await response.json();
+                if (data && data.markets && data.markets.length > 0) {
+                    const market = data.markets[0];
                     const tokenIds = JSON.parse(market.clobTokenIds || "[]");
                     const outcomes = JSON.parse(market.outcomes || "[]");
                     const index = tokenIds.indexOf(tokenId);
+                    const marketLiquidity = market.liquidity ? parseFloat(market.liquidity) : -1;
+                    const marketVolume = market.volumeNum ?? (market.volume ? parseFloat(market.volume) : undefined);
                     this.marketMetadataMap.set(tokenId, {
                         title: market.question,
                         marketId: tokenId,
@@ -318,20 +343,54 @@ export class Sentinel {
                         slug: market.slug || "",
                         outcome: outcomes[index] || "",
                         conditionId: market.conditionId,
-                        liquidity: market.liquidity ? parseFloat(market.liquidity) : -1
+                        liquidity: marketLiquidity,
+                        tvl: marketLiquidity > 0 ? marketLiquidity : undefined,
+                        volume: marketVolume
                     });
+
+                    if (market.slug) {
+                        this.enrichMetadataFromPolymarket(tokenId, market.slug).catch(() => {});
+                    }
                 }
+
             }
         } catch (e) {
             // 静默失败
         }
     }
 
+    private getSampledIndices(total: number): Set<number> {
+        const sampleSize = Math.min(10, total);
+        const seed = 20250201;
+        let state = seed;
+
+        const next = () => {
+            state = (state * 1664525 + 1013904223) >>> 0;
+            return state / 2 ** 32;
+        };
+
+        const indices = new Set<number>();
+        while (indices.size < sampleSize) {
+            const index = Math.floor(next() * total);
+            indices.add(index);
+        }
+        return indices;
+    }
+
     private startPolling() {
         if (this.pollingInterval) return;
 
-        console.log("启动价格轮询 (每 10 秒一次)...");
+        console.log(`启动价格轮询 (每 ${this.pollingIntervalMs / 1000} 秒一次)...`);
         this.pollingInterval = setInterval(async () => {
+            if (isHighPriorityActive()) {
+                return;
+            }
+            if (this.pollingInFlight >= this.pollingConcurrencyLimit) {
+                console.warn("[Polling] 上一轮未完成，跳过本轮");
+                return;
+            }
+
+            this.pollingInFlight += 1;
             try {
                 const response = await fetch("https://clob.polymarket.com/sampling-simplified-markets", {
                     headers: {
@@ -345,14 +404,14 @@ export class Sentinel {
                     const result: any = await response.json();
                     // API 返回结构是 { data: [...] }
                     if (result && Array.isArray(result.data)) {
+                        const sampledIndices = this.getSampledIndices(result.data.length);
                         result.data.forEach((market: any, index: number) => {
                             if (market.tokens && Array.isArray(market.tokens)) {
-                                market.tokens.forEach((token: any) => {
+                                for (const token of market.tokens) {
                                     this.handleUpdate(token.token_id, token.price);
-                                });
+                                }
 
-                                // 每 100 个市场输出一个抽样信息，方便观察脚本是否在正常工作
-                                if (index % 100 === 0) {
+                                if (sampledIndices.has(index)) {
                                     const firstToken = market.tokens[0];
                                     const metadata = this.marketMetadataMap.get(firstToken.token_id);
                                     console.log(`[监控抽样] 第 ${index + 1} 个市场: ${metadata?.title || '加载中...'} - 价格: ${firstToken.price}`);
@@ -377,8 +436,18 @@ export class Sentinel {
             } catch (err: any) {
                 // 轮询错误不打印堆栈，避免刷屏
                 console.error("轮询请求失败:", err.message || err);
+            } finally {
+                this.pollingInFlight = Math.max(0, this.pollingInFlight - 1);
             }
-        }, 10000);
+        }, this.pollingIntervalMs);
+
+        if (this.highPriorityPollingIntervalMs > this.pollingIntervalMs) {
+            setInterval(() => {
+                if (isHighPriorityActive()) {
+                    console.log("[Polling] 高优先级任务进行中，延后轮询");
+                }
+            }, this.highPriorityPollingIntervalMs);
+        }
     }
 
     private handleUpdate(marketId: string, price: number) {
@@ -390,6 +459,10 @@ export class Sentinel {
         }
 
         const metadata = this.marketMetadataMap.get(marketId);
+
+        if (metadata && metadata.slug && (metadata.tvl === undefined || metadata.volume === undefined)) {
+            this.enrichMetadataFromPolymarket(marketId, metadata.slug).catch(() => {});
+        }
 
         // 如果有元数据但没有 slug 或 outcome（可能是旧 CSV 导入的），尝试异步更新
         if (metadata && (!metadata.slug || !metadata.outcome)) {
@@ -432,32 +505,225 @@ export class Sentinel {
 
             // 异步执行画像分析并推送
             if (metadata) {
-                this.handleAnomaly(anomaly, metadata);
+                this.enqueueAnalysis(anomaly, metadata);
             }
         }
     }
 
     private async handleAnomaly(anomaly: any, metadata: any) {
-        try {
-            console.log(`[Sentinel] 正在处理异动: ${metadata.title}`);
-            // 1. 先发送基础警报（确保实时性）
-            await this.messenger.sendAlert(anomaly, metadata);
+        return withHighPriority(`异动分析:${metadata.title}`, async () => {
+            try {
+                console.log(`[Sentinel] 正在处理异动: ${metadata.title}`);
+                // 1. 先发送基础警报（确保实时性）
+                await this.messenger.sendAlert(anomaly, metadata);
 
-            // 2. 异步进行画像分析
-            // 传入当前价格以计算持仓价值
-            const suspiciousWallets = await this.profiler.analyzeMarket(anomaly.marketId, metadata.conditionId, anomaly.currentPrice);
-            console.log(`[Sentinel] 画像分析完成，找到 ${suspiciousWallets.length} 个高疑钱包`);
+                // 2. 推送异动事件到 LangGraph Webhook（可选）
+                const webhookPayload = await this.pushWebhookEvent(anomaly, metadata);
 
-            // 3. 发送画像分析结果（无论有无发现，都给一个反馈，形成闭环）
-            if (suspiciousWallets.length > 0) {
-                await this.messenger.sendProfilerReport(metadata, suspiciousWallets);
-                console.log(`[Sentinel] 画像报告已发送`);
-            } else {
-                // 如果是自动监控触发的异动，但没发现问题，发个简短的平安报
-                await this.messenger.sendSafeReport(metadata);
+                // 3. 异步进行画像分析（带重试）
+                const { fetchWalletProfilesFromProfiler, fetchWalletProfilesFromRemote } = await import("../workflow/analysisRunner.js");
+                const { buildErrorWorkflowResult, runWorkflowFromInputs } = await import("../workflow/langgraphFlow.js");
+                const payload = {
+                    eventType: "market.anomaly" as const,
+                    detectedAt: Date.now(),
+                    anomaly: {
+                        marketId: anomaly.marketId,
+                        previousPrice: anomaly.previousPrice,
+                        currentPrice: anomaly.currentPrice,
+                        changePercentage: anomaly.changePercentage
+                    },
+                    market: {
+                        marketId: metadata.marketId,
+                        category: metadata.category || "Unknown",
+                        title: metadata.title,
+                        slug: metadata.slug,
+                        outcome: metadata.outcome,
+                        conditionId: metadata.conditionId,
+                        liquidity: metadata.liquidity,
+                        tvl: metadata.tvl,
+                        volume: metadata.volume
+                    },
+                    source: "sentinel" as const
+                };
+
+                let walletResult = shouldUseRemoteProfiler()
+                    ? await fetchWalletProfilesFromRemote(payload)
+                    : await fetchWalletProfilesFromProfiler(this.profiler, payload);
+
+                if (shouldUseRemoteProfiler()) {
+                    console.log("[Sentinel] 使用远程 Profiler");
+                } else {
+                    console.log("[Sentinel] 使用本地 Profiler");
+                }
+
+                if (walletResult.status === "error" && shouldUseRemoteProfiler()) {
+                    console.warn(`[Sentinel] 远程画像失败，回退本地 Profiler: ${walletResult.errorMessage || "未知错误"}`);
+                    walletResult = await fetchWalletProfilesFromProfiler(this.profiler, payload);
+
+                    if (walletResult.status === "error" && !payload.market.conditionId) {
+                        try {
+                            const fallbackGamma = new GammaClient();
+                            const metadataByToken = await fallbackGamma.getMarketMetadataByTokenId(payload.anomaly.marketId);
+                            if (metadataByToken?.conditionId) {
+                                payload.market.conditionId = metadataByToken.conditionId;
+                                payload.market.slug = payload.market.slug || metadataByToken.slug;
+                                payload.market.title = payload.market.title || metadataByToken.title || payload.market.title;
+                                payload.market.liquidity = payload.market.liquidity ?? metadataByToken.liquidity;
+                                payload.market.tvl = payload.market.tvl ?? metadataByToken.tvl;
+                                payload.market.volume = payload.market.volume ?? metadataByToken.volume;
+                                walletResult = await fetchWalletProfilesFromProfiler(this.profiler, payload);
+                            }
+                        } catch (error) {
+                            console.warn("[Sentinel] 无法回填 conditionId", error);
+                        }
+                    }
+                }
+
+                console.log(`[Sentinel] 画像分析完成，状态: ${walletResult.status}，钱包数: ${walletResult.wallets.length}`);
+                await this.messenger.sendAnalysisStatus(metadata, walletResult.wallets.length);
+
+                if (walletResult.status === "error") {
+                    const sourceLabel = process.env.PROFILER_API_URL
+                        ? "远程失败，已回退本地"
+                        : "本地";
+                    await this.messenger.sendLlmReport(metadata, walletResult.errorMessage || "钱包画像获取失败，请稍后再试。", sourceLabel);
+                    return;
+                }
+
+                // 4. 调用 LLM 分析并推送结论
+                if (webhookPayload) {
+                    const llmResult = await runWorkflowFromInputs(webhookPayload, walletResult.wallets);
+                    if (llmResult.llmReport) {
+                        const sourceLabel = process.env.PROFILER_API_URL
+                            ? "远程" + (walletResult.attempts > 1 ? ` (第 ${walletResult.attempts} 次)` : "")
+                            : "本地";
+                        await this.messenger.sendLlmReport(metadata, llmResult.llmReport, sourceLabel);
+                        console.log("[Sentinel] LLM 分析结论已发送");
+                    }
+                }
+            } catch (error) {
+                console.error(`[Sentinel] 处理异动失败:`, error);
+            } finally {
+                await new Promise(resolve => setTimeout(resolve, this.analysisCooldownMs));
             }
-        } catch (error) {
-            console.error(`[Sentinel] 处理异动失败:`, error);
+        });
+    }
+
+    private enqueueAnalysis(anomaly: any, metadata: any) {
+        if (this.analysisQueue.length >= this.analysisQueueLimit) {
+            console.warn(`[Sentinel] 画像队列已满，跳过: ${metadata.title}`);
+            return;
         }
+        this.analysisQueue.push({ anomaly, metadata });
+        if (!this.analysisRunning) {
+            void this.processAnalysisQueue();
+        }
+    }
+
+    private async processAnalysisQueue() {
+        if (this.analysisRunning) return;
+        this.analysisRunning = true;
+        while (this.analysisQueue.length > 0) {
+            const item = this.analysisQueue.shift();
+            if (!item) break;
+            await this.handleAnomaly(item.anomaly, item.metadata);
+        }
+        this.analysisRunning = false;
+    }
+
+    private async enrichMetadataFromPolymarket(tokenId: string, slug: string) {
+        try {
+            const [marketResponse, eventResponse] = await Promise.all([
+                fetch(`https://polymarket.com/api/market?slug=${slug}`, {
+                    headers: {
+                        "User-Agent": "Mozilla/5.0",
+                        "Accept": "application/json"
+                    },
+                    dispatcher: globalProxyAgent
+                }),
+                fetch(`https://polymarket.com/api/event?slug=${slug}`, {
+                    headers: {
+                        "User-Agent": "Mozilla/5.0",
+                        "Accept": "application/json"
+                    },
+                    dispatcher: globalProxyAgent
+                })
+            ]);
+
+            const marketData = marketResponse.ok ? await marketResponse.json() as any : null;
+            const eventData = eventResponse.ok ? await eventResponse.json() as any : null;
+
+            const marketLiquidity = marketData?.liquidityNum ?? (marketData?.liquidity ? parseFloat(marketData.liquidity) : undefined);
+            const marketVolume = marketData?.volumeNum ?? (marketData?.volume ? parseFloat(marketData.volume) : undefined);
+            const eventLiquidity = Number.isFinite(eventData?.liquidity) ? eventData.liquidity : undefined;
+            const eventVolume = Number.isFinite(eventData?.volume) ? eventData.volume : undefined;
+
+            const resolvedLiquidity = marketLiquidity ?? eventLiquidity;
+            const resolvedVolume = marketVolume ?? eventVolume;
+
+            if (resolvedLiquidity === undefined && resolvedVolume === undefined) {
+                return;
+            }
+
+            const metadata = this.marketMetadataMap.get(tokenId) || { marketId: tokenId };
+            this.marketMetadataMap.set(tokenId, {
+                ...metadata,
+                liquidity: metadata.liquidity ?? resolvedLiquidity,
+                tvl: metadata.tvl ?? resolvedLiquidity,
+                volume: metadata.volume ?? resolvedVolume
+            });
+        } catch {
+            // 忽略更新失败
+        }
+    }
+
+    private async pushWebhookEvent(anomaly: any, metadata: any): Promise<AnomalyWebhookPayload | null> {
+        const payload: AnomalyWebhookPayload = {
+            eventType: "market.anomaly",
+            detectedAt: Date.now(),
+            anomaly: {
+                marketId: anomaly.marketId,
+                previousPrice: anomaly.previousPrice,
+                currentPrice: anomaly.currentPrice,
+                changePercentage: anomaly.changePercentage
+            },
+            market: {
+                marketId: metadata.marketId,
+                category: metadata.category || "Unknown",
+                title: metadata.title,
+                slug: metadata.slug,
+                outcome: metadata.outcome,
+                conditionId: metadata.conditionId,
+                liquidity: metadata.liquidity,
+                tvl: metadata.tvl,
+                volume: metadata.volume
+            },
+            source: "sentinel"
+        };
+
+        if (!this.webhookUrl) {
+            return payload;
+        }
+
+        try {
+            const response = await fetch(this.webhookUrl, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text().catch(() => "");
+                console.warn(`[Sentinel] Webhook 推送失败: ${response.status} ${response.statusText} ${errorText}`);
+            } else {
+                console.log(`[Sentinel] Webhook 推送成功: ${this.webhookUrl}`);
+            }
+        } catch (error: any) {
+            console.error(`[Sentinel] Webhook 推送异常: ${error.message || error}`);
+        }
+
+        return payload;
     }
 }

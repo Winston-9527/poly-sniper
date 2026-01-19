@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "dotenv/config";
 import { Sentinel } from "./sentinel/Sentinel.js";
 
 async function main() {

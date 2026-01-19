@@ -3,13 +3,88 @@ import { WalletProfile } from './types.js';
 
 export class ChainAnalyzer {
     private provider: ethers.JsonRpcProvider;
+    private fallbackRpcUrl: string;
+    private usingAnkr: boolean = false;
     private usdcAddress = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; // Polygon USDC
     private usdcAbi = ["function balanceOf(address) view returns (uint256)"];
     private cache: Map<string, { profile: WalletProfile, timestamp: number }> = new Map();
     private readonly CACHE_TTL = 24 * 60 * 60 * 1000; // 24小时
 
     constructor(rpcUrl: string = "https://polygon-rpc.com") {
-        this.provider = new ethers.JsonRpcProvider(rpcUrl);
+        const ankrKey = process.env.ANKR_API_KEY || "";
+        const ankrRpcUrl = ankrKey
+            ? `https://rpc.ankr.com/polygon/${ankrKey}`
+            : "";
+        this.fallbackRpcUrl = rpcUrl;
+        this.usingAnkr = Boolean(ankrRpcUrl);
+
+        const resolvedRpcUrl = ankrRpcUrl || rpcUrl;
+        if (ankrRpcUrl) {
+            console.log("[ChainAnalyzer] 检测到 ANKR_API_KEY，已启用 Ankr RPC");
+        } else {
+            console.log("[ChainAnalyzer] 未检测到 ANKR_API_KEY，使用默认 RPC");
+        }
+        this.provider = new ethers.JsonRpcProvider(resolvedRpcUrl, 137, {
+            staticNetwork: true,
+            batchMaxCount: 1,
+            batchStallTime: 0
+        });
+    }
+
+    private async switchToFallback(reason?: string) {
+        if (!this.usingAnkr) {
+            return;
+        }
+        console.warn(`[ChainAnalyzer] Ankr RPC 回退至默认 RPC: ${reason || "未知原因"}`);
+        this.provider = new ethers.JsonRpcProvider(this.fallbackRpcUrl, 137, {
+            staticNetwork: true,
+            batchMaxCount: 1,
+            batchStallTime: 0
+        });
+        this.usingAnkr = false;
+    }
+
+    private shouldFallback(error: any): boolean {
+        const message = `${error?.message || ""} ${error?.shortMessage || ""}`.toLowerCase();
+        return message.includes("api key is not allowed")
+            || message.includes("etimedout")
+            || message.includes("enetunreach")
+            || message.includes("econnreset")
+            || message.includes("rate limit")
+            || message.includes("batch size");
+    }
+
+    private async ensureProvider() {
+        if (!this.usingAnkr) {
+            return;
+        }
+
+        try {
+            await this.provider.getBlockNumber();
+        } catch (error: any) {
+            await this.switchToFallback(error?.message || error);
+        }
+    }
+
+    private async callWithRetry<T>(action: () => Promise<T>, label: string): Promise<T> {
+        const maxAttempts = 3;
+        let lastError: any;
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            try {
+                return await action();
+            } catch (error: any) {
+                lastError = error;
+                if (this.shouldFallback(error)) {
+                    await this.switchToFallback(`${label}: ${error?.message || error}`);
+                }
+                if (attempt < maxAttempts) {
+                    await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+                }
+            }
+        }
+
+        throw lastError;
     }
 
     async getProfile(address: string): Promise<WalletProfile> {
@@ -20,9 +95,10 @@ export class ChainAnalyzer {
         }
 
         try {
+            await this.ensureProvider();
             const [txCount, balance, marketCount, fundingAddress] = await Promise.all([
-                this.provider.getTransactionCount(address),
-                this.getUsdcBalance(address),
+                this.callWithRetry(() => this.provider.getTransactionCount(address), "getTransactionCount"),
+                this.callWithRetry(() => this.getUsdcBalance(address), "getUsdcBalance"),
                 this.getMarketCount(address),
                 this.getFundingAddress(address)
             ]);
@@ -38,11 +114,14 @@ export class ChainAnalyzer {
 
             this.cache.set(address, { profile, timestamp: now });
             return profile;
-        } catch (error) {
+        } catch (error: any) {
+            if (this.shouldFallback(error)) {
+                await this.switchToFallback(error?.message || error);
+            }
             console.error(`[ChainAnalyzer] 获取钱包画像失败 ${address}:`, error);
             return {
                 address,
-                transactionCount: 999,
+                transactionCount: 0,
                 usdcBalance: 0,
                 marketCount: 0,
                 isNew: false
