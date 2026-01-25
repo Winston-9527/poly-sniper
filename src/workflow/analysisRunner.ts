@@ -10,13 +10,29 @@ export interface WalletRetryResult {
 }
 
 let highPriorityCount = 0;
+let highPriorityPauseUntil = 0;
+const highPriorityMaxPauseMs = Number(process.env.HIGH_PRIORITY_POLLING_PAUSE_MS || 60000);
+const highPriorityPauseEnabled = process.env.HIGH_PRIORITY_POLLING_PAUSE_ENABLED === "true";
 
 export function isHighPriorityActive(): boolean {
     return highPriorityCount > 0;
 }
 
+export function shouldPausePolling(): boolean {
+    if (!highPriorityPauseEnabled) {
+        return false;
+    }
+    if (highPriorityCount === 0) {
+        return false;
+    }
+    return Date.now() < highPriorityPauseUntil;
+}
+
 export async function withHighPriority<T>(label: string, action: () => Promise<T>): Promise<T> {
     highPriorityCount += 1;
+    if (highPriorityPauseEnabled) {
+        highPriorityPauseUntil = Math.max(highPriorityPauseUntil, Date.now() + highPriorityMaxPauseMs);
+    }
     console.log(`[Priority] ${label} 开始，高优先级任务数: ${highPriorityCount}`);
     try {
         return await action();

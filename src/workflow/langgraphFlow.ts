@@ -41,6 +41,10 @@ async function buildPrompt(state: WorkflowState): Promise<string> {
         return "未提供异动信息";
     }
 
+    const missingHints: string[] = [];
+    const marketTitle = anomaly.market?.title || "未知市场";
+    const marketCategory = anomaly.market?.category || "Unknown";
+
     const walletSummary = state.wallets && state.wallets.length > 0
         ? state.wallets
             .slice(0, 10)
@@ -53,28 +57,70 @@ async function buildPrompt(state: WorkflowState): Promise<string> {
                 const balance = Number.isFinite(profile.usdcBalance) ? profile.usdcBalance.toFixed(2) : "0.00";
                 const positionValue = Number.isFinite(wallet.positionValue) ? wallet.positionValue.toFixed(2) : "0.00";
                 const eventCount = profile.eventCount ?? profile.marketCount;
-                return `${index + 1}. 地址 ${wallet.address} | 持仓价值 ${positionValue} | 交易数 ${profile.transactionCount} | 参与市场 ${profile.marketCount} | 事件数 ${eventCount} | USDC余额 ${balance} | 资金来源 ${funding} | 首次活动 ${firstSeen}`;
+                const txLabel = profile.activityCountCapped && profile.activitySampledLimit
+                    ? `>=${profile.activitySampledLimit} (采样上限)`
+                    : String(profile.transactionCount);
+                return `${index + 1}. 地址 ${wallet.address} | 持仓价值 ${positionValue} | 交易数 ${txLabel} | 参与市场 ${profile.marketCount} | 事件数 ${eventCount} | USDC余额 ${balance} | 资金来源 ${funding} | 首次活动 ${firstSeen}`;
             })
             .join("\n")
         : "未发现持仓钱包";
 
-    const liquidity = anomaly.market.liquidity ?? 0;
-    const tvl = anomaly.market.tvl ?? liquidity;
-    const volume = anomaly.market.volume ?? 0;
+    const liquidityValue = typeof anomaly.market?.liquidity === "number" && Number.isFinite(anomaly.market.liquidity)
+        ? anomaly.market.liquidity
+        : undefined;
+    const tvlValue = typeof anomaly.market?.tvl === "number" && Number.isFinite(anomaly.market.tvl)
+        ? anomaly.market.tvl
+        : undefined;
+    const volumeValue = typeof anomaly.market?.volume === "number" && Number.isFinite(anomaly.market.volume)
+        ? anomaly.market.volume
+        : undefined;
+
+    const liquidity = liquidityValue ?? tvlValue ?? 0;
+    const tvl = tvlValue ?? liquidityValue ?? 0;
+    const volume = volumeValue ?? 0;
+
+    const liquidityText = liquidityValue !== undefined ? liquidityValue.toFixed(2) : "未知";
+    const tvlText = tvlValue !== undefined ? tvlValue.toFixed(2) : "未知";
+    const volumeText = volumeValue !== undefined ? volumeValue.toFixed(2) : "未知";
+
+    const previousPrice = Number.isFinite(anomaly.anomaly.previousPrice) ? anomaly.anomaly.previousPrice : 0;
+    const currentPrice = Number.isFinite(anomaly.anomaly.currentPrice) ? anomaly.anomaly.currentPrice : 0;
+    const windowMinutes = Number.isFinite(anomaly.anomaly.windowMinutes)
+        ? anomaly.anomaly.windowMinutes
+        : undefined;
+    if (liquidityValue === undefined) {
+        missingHints.push("市场流动性缺失或为 0");
+    }
+    if (tvlValue === undefined) {
+        missingHints.push("市场 TVL 缺失或为 0");
+    }
+    if ((state.wallets?.length ?? 0) === 0) {
+        missingHints.push("未获取到持仓钱包画像");
+    }
+    if (!Number.isFinite(anomaly.anomaly.previousPrice) || !Number.isFinite(anomaly.anomaly.currentPrice)) {
+        missingHints.push("价格变化数据缺失");
+    }
+    if (!Number.isFinite(anomaly.anomaly.windowMinutes ?? NaN)) {
+        missingHints.push("缺少监控窗口价格历史");
+    }
 
     return `你是 Polymarket 内幕交易分析助手。请基于原始钱包画像数据与市场异动信息做判断，不要依赖任何机器打分。
 
-市场：${anomaly.market.title}
-分类：${anomaly.market.category}
-流动性：${liquidity}
-TVL/成交量：${tvl}
-累计成交额：${volume}
-价格变化：${anomaly.anomaly.previousPrice.toFixed(4)} -> ${anomaly.anomaly.currentPrice.toFixed(4)} (${anomaly.anomaly.changePercentage})
+市场：${marketTitle}
+分类：${marketCategory}
+流动性：${liquidityText}
+TVL/成交量：${tvlText}
+累计成交额：${volumeText}
+价格变化：${previousPrice.toFixed(4)} -> ${currentPrice.toFixed(4)} (${anomaly.anomaly.changePercentage})${windowMinutes ? `，窗口 ${windowMinutes} 分钟` : ""}
 时间：${new Date(anomaly.detectedAt).toLocaleString()}
+链上事件级分析：未启用（仅基础画像）
+${missingHints.length > 0 ? `数据缺失提示：${missingHints.join("、")}` : ""}
 
 分析要点：
 - 若流动性很低，小额市价单即可造成明显波动，需避免误判。
 - 若流动性很高，3%-5% 的价格异动通常更显著，需重点排查。
+- 若价格变化窗口显示为 0%，仍可能发生过短期波动后回归，需谨慎判断。
+- 若交易数标记为“>=50 (采样上限)”，表示活动数据被截断，不能等同于真实交易数。
 - 典型内幕钱包特征：新钱包、大额入金、重仓单一市场或同类市场、资金来源异常（如混币/大额来源）。
 
 钱包原始画像：
@@ -83,7 +129,8 @@ ${walletSummary}
 输出要求：
 1. 给出是否存在内幕嫌疑的判断（高/中/低）
 2. 用 3-5 条要点说明原因（包含流动性/TVL影响）
-3. 最后给出一句风险提示
+3. 必须给出 3-5 个疑似钱包地址（从钱包列表中挑选，使用 0x 开头完整地址）
+4. 最后给出一句风险提示
 `;
 }
 

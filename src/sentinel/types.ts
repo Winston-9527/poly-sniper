@@ -9,6 +9,7 @@ export interface Anomaly {
     previousPrice: number;
     currentPrice: number;
     changePercentage: string;
+    windowMinutes?: number;
 }
 
 export interface MarketMetadata {
@@ -49,6 +50,9 @@ export interface WalletProfile {
     isNew: boolean;
     fundingAddress?: string; // 第一笔入金来源地址
     firstSeenTimestamp?: number; // 首次活动时间 (seconds)
+    activitySampledCount?: number; // Activity API 返回条数
+    activitySampledLimit?: number; // Activity API 请求上限
+    activityCountCapped?: boolean; // 是否达到采样上限
 }
 
 export interface ScoreResult {
@@ -73,4 +77,3 @@ export interface AnomalyWebhookPayload {
     market: MarketMetadata;
     source: "sentinel";
 }
-

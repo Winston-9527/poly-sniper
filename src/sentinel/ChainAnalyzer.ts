@@ -1,28 +1,37 @@
 import { ethers } from 'ethers';
+import { configureProxyAgents, getProxyUrl } from '../network/proxy.js';
 import { WalletProfile } from './types.js';
 
 export class ChainAnalyzer {
     private provider: ethers.JsonRpcProvider;
     private fallbackRpcUrl: string;
-    private usingAnkr: boolean = false;
+    private usingAlchemy: boolean = false;
     private usdcAddress = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; // Polygon USDC
     private usdcAbi = ["function balanceOf(address) view returns (uint256)"];
     private cache: Map<string, { profile: WalletProfile, timestamp: number }> = new Map();
     private readonly CACHE_TTL = 24 * 60 * 60 * 1000; // 24小时
+    private rpcInFlight = 0;
+    private readonly rpcConcurrencyLimit = Number(process.env.RPC_CONCURRENCY_LIMIT || 1);
+    private readonly rpcHealthTimeoutMs = Number(process.env.RPC_HEALTH_TIMEOUT_MS || 8000);
 
     constructor(rpcUrl: string = "https://polygon-rpc.com") {
-        const ankrKey = process.env.ANKR_API_KEY || "";
-        const ankrRpcUrl = ankrKey
-            ? `https://rpc.ankr.com/polygon/${ankrKey}`
-            : "";
+        configureProxyAgents();
+        const alchemyApiKey = process.env.ALCHEMY_API_KEY || "";
+        const alchemyRpcUrl = process.env.ALCHEMY_RPC_URL || (alchemyApiKey
+            ? `https://polygon-mainnet.g.alchemy.com/v2/${alchemyApiKey}`
+            : "");
         this.fallbackRpcUrl = rpcUrl;
-        this.usingAnkr = Boolean(ankrRpcUrl);
+        this.usingAlchemy = Boolean(alchemyRpcUrl);
 
-        const resolvedRpcUrl = ankrRpcUrl || rpcUrl;
-        if (ankrRpcUrl) {
-            console.log("[ChainAnalyzer] 检测到 ANKR_API_KEY，已启用 Ankr RPC");
+        const resolvedRpcUrl = alchemyRpcUrl || rpcUrl;
+        if (alchemyRpcUrl) {
+            console.log("[ChainAnalyzer] 检测到 ALCHEMY_RPC_URL，已启用 Alchemy RPC");
         } else {
-            console.log("[ChainAnalyzer] 未检测到 ANKR_API_KEY，使用默认 RPC");
+            console.log("[ChainAnalyzer] 未检测到 ALCHEMY_RPC_URL 或 ALCHEMY_API_KEY，使用默认 RPC");
+        }
+        const proxyUrl = getProxyUrl();
+        if (proxyUrl) {
+            console.log(`[ChainAnalyzer] RPC 使用代理: ${proxyUrl}`);
         }
         this.provider = new ethers.JsonRpcProvider(resolvedRpcUrl, 137, {
             staticNetwork: true,
@@ -31,17 +40,33 @@ export class ChainAnalyzer {
         });
     }
 
+    async checkRpcHealth() {
+        const timeoutMs = this.rpcHealthTimeoutMs;
+        const startTime = Date.now();
+        try {
+            await Promise.race([
+                this.provider.getBlockNumber(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("RPC health check timeout")), timeoutMs))
+            ]);
+            const duration = Date.now() - startTime;
+            console.log(`[ChainAnalyzer] RPC 健康检查通过 (${duration}ms)`);
+        } catch (error: any) {
+            const reason = this.formatRpcError(error);
+            await this.switchToFallback(reason);
+        }
+    }
+
     private async switchToFallback(reason?: string) {
-        if (!this.usingAnkr) {
+        if (!this.usingAlchemy) {
             return;
         }
-        console.warn(`[ChainAnalyzer] Ankr RPC 回退至默认 RPC: ${reason || "未知原因"}`);
+        console.warn(`[ChainAnalyzer] Alchemy RPC 回退至默认 RPC: ${reason || "未知原因"}`);
         this.provider = new ethers.JsonRpcProvider(this.fallbackRpcUrl, 137, {
             staticNetwork: true,
             batchMaxCount: 1,
             batchStallTime: 0
         });
-        this.usingAnkr = false;
+        this.usingAlchemy = false;
     }
 
     private shouldFallback(error: any): boolean {
@@ -55,33 +80,55 @@ export class ChainAnalyzer {
     }
 
     private async ensureProvider() {
-        if (!this.usingAnkr) {
+        if (!this.usingAlchemy) {
             return;
         }
 
         try {
             await this.provider.getBlockNumber();
         } catch (error: any) {
-            await this.switchToFallback(error?.message || error);
+            await this.switchToFallback(this.formatRpcError(error));
         }
+    }
+
+    private formatRpcError(error: any): string {
+        const message = error?.message || error?.shortMessage || "未知错误";
+        const code = error?.code || error?.cause?.code;
+        return code ? `${message} (code: ${code})` : message;
+    }
+
+    private async waitForRpcSlot() {
+        while (this.rpcInFlight >= this.rpcConcurrencyLimit) {
+            await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        this.rpcInFlight += 1;
+    }
+
+    private releaseRpcSlot() {
+        this.rpcInFlight = Math.max(0, this.rpcInFlight - 1);
     }
 
     private async callWithRetry<T>(action: () => Promise<T>, label: string): Promise<T> {
         const maxAttempts = 3;
         let lastError: any;
 
-        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-            try {
-                return await action();
-            } catch (error: any) {
-                lastError = error;
-                if (this.shouldFallback(error)) {
-                    await this.switchToFallback(`${label}: ${error?.message || error}`);
-                }
-                if (attempt < maxAttempts) {
-                    await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+        await this.waitForRpcSlot();
+        try {
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                try {
+                    return await action();
+                } catch (error: any) {
+                    lastError = error;
+                    if (this.shouldFallback(error)) {
+                        await this.switchToFallback(`${label}: ${error?.message || error}`);
+                    }
+                    if (attempt < maxAttempts) {
+                        await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+                    }
                 }
             }
+        } finally {
+            this.releaseRpcSlot();
         }
 
         throw lastError;

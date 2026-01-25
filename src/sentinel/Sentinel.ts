@@ -1,5 +1,5 @@
 import { ClobClient } from '@polymarket/clob-client';
-import { fetch, setGlobalDispatcher, ProxyAgent } from 'undici';
+import { fetch } from 'undici';
 import fs from 'fs';
 import path from 'path';
 import { AnomalyDetector } from './AnomalyDetector.js';
@@ -10,17 +10,16 @@ import { GammaClient } from './GammaClient.js';
 import { ChainAnalyzer } from './ChainAnalyzer.js';
 import { Scorer } from './Scorer.js';
 import { AnomalyWebhookPayload, MarketUpdate } from './types.js';
-import { shouldUseRemoteProfiler, withHighPriority, isHighPriorityActive } from "../workflow/analysisRunner.js";
+import { shouldUseRemoteProfiler, withHighPriority } from "../workflow/analysisRunner.js";
+import { enqueueAnalysisTask } from "../workflow/analysisQueue.js";
+import { configureProxyAgents, getProxyUrl, getUndiciDispatcher } from '../network/proxy.js';
+import { recordPrice } from './priceHistory.js';
 
-// 检查代理设置
-const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY;
-
-let globalProxyAgent: ProxyAgent | undefined;
-
+configureProxyAgents();
+const proxyUrl = getProxyUrl();
+const globalProxyAgent = getUndiciDispatcher();
 if (proxyUrl) {
     console.log(`检测到代理设置: ${proxyUrl}，正在配置代理...`);
-    globalProxyAgent = new ProxyAgent(proxyUrl);
-    setGlobalDispatcher(globalProxyAgent);
 }
 
 export interface SentinelConfig {
@@ -40,10 +39,7 @@ export class Sentinel {
     private messageCount: number = 0;
     private readonly csvPath = path.join(process.cwd(), 'data', 'markets.csv');
     private readonly webhookUrl = process.env.LANGGRAPH_WEBHOOK_URL || "";
-    private readonly analysisQueue: Array<{ anomaly: any; metadata: any }> = [];
-    private analysisRunning = false;
     private readonly analysisCooldownMs = Number(process.env.ANALYSIS_COOLDOWN_MS || 1500);
-    private readonly analysisQueueLimit = Number(process.env.ANALYSIS_QUEUE_LIMIT || 3);
     private readonly pollingIntervalMs = Number(process.env.POLLING_INTERVAL_MS || 15000);
     private readonly pollingConcurrencyLimit = Number(process.env.POLLING_CONCURRENCY_LIMIT || 4);
     private pollingInFlight = 0;
@@ -76,6 +72,8 @@ export class Sentinel {
         try {
             // 1. 先尝试从本地 CSV 加载
             this.loadFromCsv();
+
+            await this.profiler.warmup();
 
             // 2. 启动定时刷新任务（每小时一次）
             this.startMetadataRefresh();
@@ -382,9 +380,6 @@ export class Sentinel {
 
         console.log(`启动价格轮询 (每 ${this.pollingIntervalMs / 1000} 秒一次)...`);
         this.pollingInterval = setInterval(async () => {
-            if (isHighPriorityActive()) {
-                return;
-            }
             if (this.pollingInFlight >= this.pollingConcurrencyLimit) {
                 console.warn("[Polling] 上一轮未完成，跳过本轮");
                 return;
@@ -404,6 +399,13 @@ export class Sentinel {
                     const result: any = await response.json();
                     // API 返回结构是 { data: [...] }
                     if (result && Array.isArray(result.data)) {
+                        let tokenCount = 0;
+                        result.data.forEach((market: any) => {
+                            if (market.tokens && Array.isArray(market.tokens)) {
+                                tokenCount += market.tokens.length;
+                            }
+                        });
+                        console.log(`[Polling] 本轮市场数: ${result.data.length}，token 数: ${tokenCount}`);
                         const sampledIndices = this.getSampledIndices(result.data.length);
                         result.data.forEach((market: any, index: number) => {
                             if (market.tokens && Array.isArray(market.tokens)) {
@@ -441,13 +443,6 @@ export class Sentinel {
             }
         }, this.pollingIntervalMs);
 
-        if (this.highPriorityPollingIntervalMs > this.pollingIntervalMs) {
-            setInterval(() => {
-                if (isHighPriorityActive()) {
-                    console.log("[Polling] 高优先级任务进行中，延后轮询");
-                }
-            }, this.highPriorityPollingIntervalMs);
-        }
     }
 
     private handleUpdate(marketId: string, price: number) {
@@ -487,6 +482,8 @@ export class Sentinel {
         if (this.messageCount % 500 === 0) {
             console.log(`[系统存活] ${new Date().toLocaleTimeString()} - 已处理 ${this.messageCount} 条价格更新...`);
         }
+
+        recordPrice(marketId, price, Date.now());
 
         const update: MarketUpdate = {
             marketId,
@@ -586,7 +583,7 @@ export class Sentinel {
                     const sourceLabel = process.env.PROFILER_API_URL
                         ? "远程失败，已回退本地"
                         : "本地";
-                    await this.messenger.sendLlmReport(metadata, walletResult.errorMessage || "钱包画像获取失败，请稍后再试。", sourceLabel);
+                    await this.messenger.sendLlmReport(metadata, walletResult.errorMessage || "钱包画像获取失败，请稍后再试。", sourceLabel, walletResult.wallets);
                     return;
                 }
 
@@ -597,7 +594,7 @@ export class Sentinel {
                         const sourceLabel = process.env.PROFILER_API_URL
                             ? "远程" + (walletResult.attempts > 1 ? ` (第 ${walletResult.attempts} 次)` : "")
                             : "本地";
-                        await this.messenger.sendLlmReport(metadata, llmResult.llmReport, sourceLabel);
+                        await this.messenger.sendLlmReport(metadata, llmResult.llmReport, sourceLabel, walletResult.wallets);
                         console.log("[Sentinel] LLM 分析结论已发送");
                     }
                 }
@@ -610,25 +607,10 @@ export class Sentinel {
     }
 
     private enqueueAnalysis(anomaly: any, metadata: any) {
-        if (this.analysisQueue.length >= this.analysisQueueLimit) {
-            console.warn(`[Sentinel] 画像队列已满，跳过: ${metadata.title}`);
-            return;
+        const enqueued = enqueueAnalysisTask(`异动分析:${metadata.title}`, () => this.handleAnomaly(anomaly, metadata));
+        if (!enqueued) {
+            void this.messenger.sendAlert(anomaly, metadata);
         }
-        this.analysisQueue.push({ anomaly, metadata });
-        if (!this.analysisRunning) {
-            void this.processAnalysisQueue();
-        }
-    }
-
-    private async processAnalysisQueue() {
-        if (this.analysisRunning) return;
-        this.analysisRunning = true;
-        while (this.analysisQueue.length > 0) {
-            const item = this.analysisQueue.shift();
-            if (!item) break;
-            await this.handleAnomaly(item.anomaly, item.metadata);
-        }
-        this.analysisRunning = false;
     }
 
     private async enrichMetadataFromPolymarket(tokenId: string, slug: string) {

@@ -6,6 +6,7 @@
     "start": "node dist/index.js",
     "dev": "node --loader ts-node/esm src/index.ts",
     "test:manual": "node test-manual-command.js",
+    "test:alchemy": "node --loader ts-node/esm src/test-alchemy.ts",
     "test:mcp": "node --loader ts-node/esm src/test-mcp.ts",
     "test:workflow": "node --loader ts-node/esm src/test-langgraph-workflow.ts",
     "test:e2e:prod": "node --loader ts-node/esm src/test-e2e-production.ts",

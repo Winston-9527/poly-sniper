@@ -1,5 +1,20 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import { createServer, IncomingMessage, ServerResponse } from 'node:http';
+import { URL } from 'node:url';
+import { ClobClient } from '@polymarket/clob-client';
+import { configureProxyAgents, getProxyUrl, getHttpsProxyAgent } from '../network/proxy.js';
+import { enqueueAnalysisTask } from '../workflow/analysisQueue.js';
+import { getPriceTrend } from './priceHistory.js';
+
+// /check 手动分析超时
+const MANUAL_ANALYSIS_TIMEOUT_MS = 90000;
+// LLM 结果中钱包链接数量上限
+const LLM_WALLET_LINK_LIMIT = 10;
+// webhook 不可用时是否回退 polling
+const TELEGRAM_POLLING_FALLBACK_ENABLED = true;
+// Telegram 发送代理最大连接数
+const TELEGRAM_PROXY_MAX_SOCKETS = 10;
 import { Anomaly, MarketMetadata, ScoreResult } from './types.js';
 import { Profiler } from './Profiler.js';
 import { GammaClient } from './GammaClient.js';
@@ -10,6 +25,7 @@ export class TelegramMessenger {
     private chatId: string | null = null;
     private profiler: Profiler | null = null;
     private gamma: GammaClient;
+    private clobClient: ClobClient;
     private pollingRestarting = false;
     private pollingRetryCount = 0;
     private pollingOptions?: TelegramBot.PollingOptions;
@@ -17,14 +33,24 @@ export class TelegramMessenger {
     private sendQueue: Promise<void> = Promise.resolve();
     private botToken?: string;
     private proxyUrl?: string;
+    private requestAgent?: HttpsProxyAgent<any>;
+    private pollingEnabled = false;
+    private webhookEnabled = false;
+    private pollingFallbackEnabled = false;
+    private webhookServer?: ReturnType<typeof createServer>;
+    private webhookUrl?: string;
+    private webhookPath?: string;
+    private webhookSecret?: string;
 
     constructor(profiler?: Profiler, botOverride?: TelegramBot) {
         this.profiler = profiler || null;
         this.gamma = new GammaClient(); // Used for slug resolution
+        this.clobClient = new ClobClient("https://clob.polymarket.com", 137);
+        configureProxyAgents();
         const token = process.env.TELEGRAM_BOT_TOKEN;
         this.botToken = token || undefined;
         this.chatId = process.env.TELEGRAM_CHAT_ID || null;
-        const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY;
+        const proxyUrl = getProxyUrl();
         this.proxyUrl = proxyUrl || undefined;
 
         if (botOverride) {
@@ -37,7 +63,22 @@ export class TelegramMessenger {
                 this.setupCommands();
             }
         } else if (token && this.chatId) {
-            const polling: TelegramBot.PollingOptions | boolean = profiler
+            this.pollingEnabled = process.env.TELEGRAM_POLLING_ENABLED === "true";
+            this.webhookEnabled = process.env.TELEGRAM_WEBHOOK_ENABLED === "true";
+            this.pollingFallbackEnabled = TELEGRAM_POLLING_FALLBACK_ENABLED;
+            this.webhookUrl = process.env.TELEGRAM_WEBHOOK_URL || undefined;
+            if (this.webhookEnabled && !this.webhookUrl) {
+                console.warn("[Messenger] 未配置 TELEGRAM_WEBHOOK_URL，无法启用 webhook");
+                this.webhookEnabled = false;
+                if (this.pollingFallbackEnabled && profiler) {
+                    this.pollingEnabled = true;
+                    console.warn("[Messenger] webhook 不可用，已回退到 polling 以支持 /check 指令");
+                }
+            }
+            if (this.webhookEnabled) {
+                this.pollingEnabled = false;
+            }
+            const polling: TelegramBot.PollingOptions | boolean = profiler && this.pollingEnabled
                 ? { interval: Number(process.env.TELEGRAM_POLLING_INTERVAL_MS || 2000) }
                 : false;
             const options: TelegramBot.ConstructorOptions = { polling };
@@ -45,23 +86,33 @@ export class TelegramMessenger {
 
             if (proxyUrl) {
                 console.log(`[Messenger] Telegram 机器人正在使用代理: ${proxyUrl}`);
+                this.requestAgent = getHttpsProxyAgent() ?? this.createProxyAgent(proxyUrl);
                 // @ts-ignore - node-telegram-bot-api 的类型定义可能不包含 request 选项
                 options.request = {
-                    agent: new HttpsProxyAgent(proxyUrl)
+                    agent: this.requestAgent
                 };
             }
 
             this.bot = new TelegramBot(token, options);
             console.log(`[Messenger] Telegram 机器人已初始化。目标 Chat ID: ${this.chatId}。Polling模式: ${options.polling}`);
 
-            // 添加 polling 错误监听
-            this.bot.on('polling_error', (error: any) => {
-                console.error(`[Messenger] polling_error: ${error.code || 'UNKNOWN'} - ${error.message}`);
-                this.restartPolling();
-            });
+            if (this.webhookEnabled) {
+                if (this.profiler) {
+                    this.setupCommands();
+                }
+                void this.setupWebhook();
+            } else if (this.pollingEnabled) {
+                // 添加 polling 错误监听
+                this.bot.on('polling_error', (error: any) => {
+                    console.error(`[Messenger] polling_error: ${error.code || 'UNKNOWN'} - ${error.message}`);
+                    this.restartPolling();
+                });
 
-            if (this.profiler) {
-                this.setupCommands();
+                if (this.profiler) {
+                    this.setupCommands();
+                }
+            } else if (this.profiler) {
+                console.warn("[Messenger] 已禁用 Telegram polling，/check 指令不可用");
             }
         } else {
             console.warn("[Messenger] 未配置 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID，Telegram 推送已禁用。");
@@ -70,6 +121,7 @@ export class TelegramMessenger {
 
     private async restartPolling() {
         if (!this.bot || !this.botToken) return;
+        if (!this.pollingEnabled) return;
         if (this.pollingRestarting) return;
 
         this.pollingRestarting = true;
@@ -99,7 +151,7 @@ export class TelegramMessenger {
                 polling: this.pollingOptions ?? true,
                 // @ts-ignore - request agent type mismatch
                 request: this.proxyUrl
-                    ? { agent: new HttpsProxyAgent(this.proxyUrl) }
+                    ? { agent: this.requestAgent ?? getHttpsProxyAgent() ?? this.createProxyAgent(this.proxyUrl) }
                     : undefined
             });
             this.bot.on('polling_error', (error: any) => {
@@ -117,6 +169,13 @@ export class TelegramMessenger {
         } finally {
             this.pollingRestarting = false;
         }
+    }
+
+    private createProxyAgent(proxyUrl: string): HttpsProxyAgent<any> {
+        return new HttpsProxyAgent(proxyUrl, {
+            keepAlive: true,
+            maxSockets: TELEGRAM_PROXY_MAX_SOCKETS
+        } as any);
     }
 
     private setupCommands() {
@@ -141,7 +200,115 @@ export class TelegramMessenger {
             }
 
             await withHighPriority(`手动分析:${input}`, async () => {
-                await this.handleManualAnalysis(chatId, input);
+                if (this.pollingPaused) {
+                    console.warn("[Messenger] polling 已暂停，优先处理 /check");
+                }
+                const enqueued = enqueueAnalysisTask(`手动分析:${input}`, () => this.runManualAnalysisWithTimeout(chatId, input));
+                if (!enqueued) {
+                    await this.sendMessageWithRetry(chatId.toString(), "手动分析队列已满，请稍后再试。", {});
+                }
+            });
+        });
+    }
+
+    private async runManualAnalysisWithTimeout(chatId: number, input: string) {
+        const timeoutMs = MANUAL_ANALYSIS_TIMEOUT_MS;
+        const analysisPromise = this.handleManualAnalysis(chatId, input)
+            .catch(error => {
+                console.error("[Messenger] 手动分析失败:", error);
+            });
+        const result = await Promise.race([
+            analysisPromise.then(() => "ok"),
+            new Promise(resolve => setTimeout(() => resolve("timeout"), timeoutMs))
+        ]);
+        if (result === "timeout") {
+            await this.sendMessageWithRetry(chatId.toString(), "手动分析超时，请稍后再试。", {});
+        }
+    }
+
+    private async setupWebhook() {
+        if (!this.bot || !this.botToken) {
+            return;
+        }
+
+        if (this.webhookServer) {
+            return;
+        }
+
+        const webhookUrl = this.webhookUrl || process.env.TELEGRAM_WEBHOOK_URL || "";
+        if (!webhookUrl) {
+            console.warn("[Messenger] 未配置 TELEGRAM_WEBHOOK_URL，无法启用 webhook");
+            return;
+        }
+
+        const parsedUrl = new URL(webhookUrl);
+        this.webhookUrl = webhookUrl;
+        this.webhookPath = process.env.TELEGRAM_WEBHOOK_PATH || parsedUrl.pathname || "/telegram/webhook";
+        this.webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET || undefined;
+
+        const port = Number(process.env.TELEGRAM_WEBHOOK_PORT || 8792);
+        this.webhookServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+            if (!req.url) {
+                res.writeHead(404);
+                res.end();
+                return;
+            }
+            const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
+            if (req.method !== "POST" || url.pathname !== this.webhookPath) {
+                res.writeHead(404);
+                res.end();
+                return;
+            }
+
+            if (this.webhookSecret) {
+                const secret = req.headers["x-telegram-bot-api-secret-token"];
+                if (!secret || secret !== this.webhookSecret) {
+                    res.writeHead(403);
+                    res.end();
+                    return;
+                }
+            }
+
+            try {
+                const body = await this.parseWebhookBody(req);
+                this.bot?.processUpdate(body);
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ ok: true }));
+            } catch (error) {
+                res.writeHead(400);
+                res.end();
+            }
+        });
+
+        await new Promise<void>(resolve => {
+            this.webhookServer?.listen(port, () => {
+                console.log(`[Messenger] Telegram webhook 已启动: http://127.0.0.1:${port}${this.webhookPath}`);
+                resolve();
+            });
+        });
+
+        await this.bot.setWebHook(this.webhookUrl, this.webhookSecret
+            ? { secret_token: this.webhookSecret }
+            : undefined);
+        console.log(`[Messenger] Telegram webhook 已注册: ${this.webhookUrl}`);
+    }
+
+    private parseWebhookBody(req: IncomingMessage): Promise<any> {
+        return new Promise((resolve, reject) => {
+            let body = "";
+            req.on("data", (chunk: Buffer) => {
+                body += chunk.toString();
+            });
+            req.on("end", () => {
+                if (!body) {
+                    resolve({});
+                    return;
+                }
+                try {
+                    resolve(JSON.parse(body));
+                } catch (error) {
+                    reject(error);
+                }
             });
         });
     }
@@ -187,6 +354,27 @@ export class TelegramMessenger {
                 return;
             }
 
+            let currentPrice = 0.5;
+            let previousPrice = currentPrice;
+            let changePercentage = "0%";
+            let windowMinutes: number | undefined;
+            if (metadata.tokenIds && metadata.tokenIds.length > 0) {
+                try {
+                    const priceData = await this.clobClient.getLastTradePrice(metadata.tokenIds[0]);
+                    if (priceData?.price) {
+                        currentPrice = parseFloat(priceData.price);
+                    }
+                    const trend = getPriceTrend(metadata.tokenIds[0]);
+                    if (trend && trend.samples >= 2) {
+                        previousPrice = trend.firstPrice;
+                        changePercentage = trend.changePercentage;
+                        windowMinutes = trend.windowMinutes;
+                    }
+                } catch (error) {
+                    console.warn("[Messenger] 获取盘口价格失败，使用默认 0.5", error);
+                }
+            }
+
             const reportMetadata: MarketMetadata = {
                 title: metadata.title,
                 marketId: metadata.id,
@@ -206,9 +394,10 @@ export class TelegramMessenger {
                 detectedAt: Date.now(),
                 anomaly: {
                     marketId: metadata.tokenIds[0] || metadata.id,
-                    previousPrice: 0.5,
-                    currentPrice: 0.5,
-                    changePercentage: "0%"
+                    previousPrice: previousPrice,
+                    currentPrice: currentPrice,
+                    changePercentage: changePercentage,
+                    windowMinutes
                 },
                 market: reportMetadata,
                 source: "sentinel" as const
@@ -224,7 +413,7 @@ export class TelegramMessenger {
             }
 
             if (walletResult.status === "error") {
-                await this.sendLlmReport(reportMetadata, walletResult.errorMessage || "钱包画像获取失败，请稍后再试。", process.env.PROFILER_API_URL ? "远程失败已回退本地" : "本地");
+                await this.sendLlmReport(reportMetadata, walletResult.errorMessage || "钱包画像获取失败，请稍后再试。", process.env.PROFILER_API_URL ? "远程失败已回退本地" : "本地", walletResult.wallets);
                 return;
             }
 
@@ -236,7 +425,7 @@ export class TelegramMessenger {
                 const sourceLabel = process.env.PROFILER_API_URL
                     ? "远程" + (walletResult.attempts > 1 ? ` (第 ${walletResult.attempts} 次)` : "")
                     : "本地";
-                await this.sendLlmReport(reportMetadata, llmResult.llmReport, sourceLabel);
+                await this.sendLlmReport(reportMetadata, llmResult.llmReport, sourceLabel, walletResult.wallets);
                 await this.sendMessageWithRetry(chatId.toString(), "LLM 分析完成，已推送结论。", {
                     disable_web_page_preview: true
                 });
@@ -293,16 +482,36 @@ export class TelegramMessenger {
     /**
      * 发送 LLM 分析结论
      */
-    async sendLlmReport(metadata: MarketMetadata, llmReport: string, sourceLabel: string = "本地") {
+    async sendLlmReport(metadata: MarketMetadata, llmReport: string, sourceLabel: string = "本地", wallets: ScoreResult[] = []) {
         if (!this.bot || !this.chatId) return;
 
-        const report = `*\[🧠 LLM 原始画像分析\]*\n*市场:* ${this.escapeMarkdown(metadata.title)}\n*画像来源:* ${this.escapeMarkdown(sourceLabel)}\n\n${this.escapeMarkdown(llmReport)}`;
+        const report = `*\[🧠 LLM 原始画像分析\]*\n*市场:* ${this.escapeMarkdown(metadata.title)}\n*画像来源:* ${this.escapeMarkdown(sourceLabel)}\n\n${this.escapeMarkdown(llmReport)}${this.buildWalletLinks(llmReport, wallets)}`;
 
         await this.sendMessageWithRetry(this.chatId, report, {
             parse_mode: 'Markdown',
             disable_web_page_preview: true
         });
 
+    }
+
+    private buildWalletLinks(llmReport: string, wallets: ScoreResult[]): string {
+        const maxLinks = LLM_WALLET_LINK_LIMIT;
+        const addressMatches = llmReport.match(/0x[a-fA-F0-9]{40}/g) || [];
+        const uniqueAddresses = Array.from(new Set(addressMatches));
+        const addresses = uniqueAddresses.length > 0
+            ? uniqueAddresses
+            : wallets.map(wallet => wallet.address);
+
+        if (addresses.length === 0) {
+            return "";
+        }
+
+        const lines = addresses.slice(0, maxLinks).map(address => {
+            const short = `${address.slice(0, 6)}...${address.slice(-4)}`;
+            const url = `https://polymarket.com/profile/${address}`;
+            return `- [${short}](${url})`;
+        });
+        return `\n\n*疑似钱包地址链接:*\n${lines.join("\n")}`;
     }
 
     /**

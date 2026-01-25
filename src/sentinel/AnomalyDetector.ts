@@ -55,7 +55,8 @@ export class AnomalyDetector {
                 marketId: update.marketId,
                 previousPrice: firstPrice,
                 currentPrice: currentPrice,
-                changePercentage: `${sign}${(diff * 100).toFixed(2)}%`
+                changePercentage: `${sign}${(diff * 100).toFixed(2)}%`,
+                windowMinutes: Math.round(this.windowMs / 60000)
             };
         }
 

@@ -51,12 +51,24 @@ npm install
 # Telegram Bot 配置 (用于接收报警推送)
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id
+# 是否启用 Telegram polling（用于接收 /check 指令）
+TELEGRAM_POLLING_ENABLED=false
+TELEGRAM_POLLING_INTERVAL_MS=2000
+# 是否启用 Telegram webhook（用于接收 /check 指令）
+TELEGRAM_WEBHOOK_ENABLED=false
+TELEGRAM_WEBHOOK_URL=
+TELEGRAM_WEBHOOK_PORT=8792
+TELEGRAM_WEBHOOK_PATH=/telegram/webhook
+TELEGRAM_WEBHOOK_SECRET=
 
 # 区块链与网络配置
 # Polygon RPC 节点地址 (用于链上数据分析)
 POLYGON_RPC_URL=https://polygon-rpc.com
 # 或者使用通用的 RPC_URL
 RPC_URL=https://polygon-rpc.com
+# 优先使用 Alchemy（可填 API Key 或完整 RPC URL）
+ALCHEMY_API_KEY=your_alchemy_key
+ALCHEMY_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/your_alchemy_key
 
 # (可选) 代理配置 - 如果你的网络环境需要代理才能访问 Polymarket 或 Telegram API
 HTTPS_PROXY=http://127.0.0.1:7890
@@ -65,6 +77,34 @@ HTTP_PROXY=http://127.0.0.1:7890
 
 *   **获取 Telegram Token**: 在 Telegram 中联系 [@BotFather](https://t.me/BotFather) 创建新机器人获取 Token。
 *   **获取 Chat ID**: 将你的机器人拉入群组，或直接私聊，通过相关工具或 API 获取 Chat ID。
+
+### Telegram Webhook (Cloudflare Tunnel)
+
+当你需要稳定接收 `/check` 指令时，推荐使用 Cloudflare Tunnel（无需公网域名）。
+
+前置条件：本机已安装 `cloudflared`。
+
+**快速启动（推荐）**
+```bash
+bash scripts/start-telegram-webhook.sh
+```
+
+脚本会自动：
+1) 启动 `cloudflared` 隧道
+2) 获取公网 HTTPS 地址
+3) 注入环境变量并启动服务
+
+**手动启动（可选）**
+```bash
+cloudflared tunnel --url http://127.0.0.1:8792
+```
+
+将输出的 `https://xxxx.trycloudflare.com` 写入 `.env`：
+```env
+TELEGRAM_WEBHOOK_ENABLED=true
+TELEGRAM_POLLING_ENABLED=false
+TELEGRAM_WEBHOOK_URL=https://xxxx.trycloudflare.com/telegram/webhook
+```
 
 ## 🚀 使用指南 (Usage)
 

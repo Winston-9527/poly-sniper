@@ -3,6 +3,9 @@ import { ChainAnalyzer } from './ChainAnalyzer.js';
 import { Scorer } from './Scorer.js';
 import { ScoreResult } from './types.js';
 
+// 画像入选阈值（分数越高越严格）
+const PROFILER_MIN_SCORE = 0;
+
 export class Profiler {
     constructor(
         private gamma: GammaClient = new GammaClient(),
@@ -10,15 +13,20 @@ export class Profiler {
         private scorer: Scorer = new Scorer()
     ) { }
 
+    async warmup() {
+        await this.analyzer.checkRpcHealth();
+    }
+
     /**
      * 分析特定市场的持仓者
      * @param tokenId Polymarket Token ID
      * @param conditionId Optional Condition ID (if known) to bypass Gamma lookup
      * @param currentPrice 当前代币价格 (用于计算持仓价值)
-     * @returns 高分可疑钱包列表
+     * @returns 满足阈值的钱包列表
      */
     async analyzeMarket(tokenId: string, conditionId?: string, currentPrice: number = 0.5): Promise<ScoreResult[]> {
         console.log(`[Profiler] 正在分析市场持仓者: ${tokenId} (价格: ${currentPrice})`);
+        const minScore = PROFILER_MIN_SCORE;
 
         let targetConditionId = conditionId;
 
@@ -55,12 +63,16 @@ export class Profiler {
 
                 // 2. 增强画像 (Off-chain Data API)
                 // 原始 RPC Nonce 不准，使用 Polymarket Activity 修正活跃度和市场数
-                const activities = await this.gamma.getUserActivity(holder.address, 50);
+                const activityLimit = 50;
+                const activities = await this.gamma.getUserActivity(holder.address, activityLimit);
 
                 // 修正交易次数: 取 RPC Nonce 和 Activity Log Length 的较大值
                 // 如果 Activity 拿满了50条，说明非常活跃，直接覆盖
                 if (activities.length > 0) {
                     profile.transactionCount = Math.max(profile.transactionCount, activities.length);
+                    profile.activitySampledCount = activities.length;
+                    profile.activitySampledLimit = activityLimit;
+                    profile.activityCountCapped = activities.length >= activityLimit;
                     // 估算首次活跃时间
                     // Activity API 返回通常是倒序 (最新的在前)，所以取最后一个作为"最早观察到的时间"
                     const oldestActivity = activities[activities.length - 1];
@@ -112,13 +124,16 @@ export class Profiler {
 
             const scoreResult = this.scorer.score(item.profile, positionValue, isCorrelated);
 
-            // 仅记录有一定可疑度的钱包 (新阈值 60)
-            if (scoreResult.totalScore >= 60) {
+            if (scoreResult.totalScore >= minScore) {
                 results.push({
                     ...scoreResult,
                     profile: item.profile
                 });
             }
+        }
+
+        if (profilesWithHoldings.length > 0) {
+            console.log(`[Profiler] 画像筛选阈值: ${minScore}，持仓数: ${profilesWithHoldings.length}，入选数: ${results.length}`);
         }
 
         // 按分数降序排列
