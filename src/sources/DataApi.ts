@@ -69,6 +69,52 @@ export class DataApiClient {
         catch (e) { return this.contractErr(e, url, r.ms); }
     }
 
+    /**
+     * 按 conditionId 取市场元数据（报告的市场维度依赖它）。
+     * 顺序：gamma 默认 → gamma closed=true（已结算市场默认不返回）→ CLOB /markets/<id> 兜底。
+     * 全部失败返回 ok(null)：调用方按「市场信息缺失」记录缺口，不臆造标题。
+     */
+    async getMarketByCondition(conditionId: string): Promise<Result<GammaMarket | null>> {
+        const q = `condition_ids=${encodeURIComponent(conditionId)}`;
+        const first = await this.getMarkets(q);
+        if (first.ok && first.data.length) return ok(first.data[0], { url: first.url, status: first.status, ms: first.ms });
+        if (!first.ok && (first.kind === 'contract' || first.kind === 'budget')) return first;
+        const inclClosed = await this.getMarkets(`${q}&closed=true`);
+        if (inclClosed.ok && inclClosed.data.length) return ok(inclClosed.data[0], { url: inclClosed.url, status: inclClosed.status, ms: inclClosed.ms });
+        const clob = await this.getClobMarket(conditionId);
+        if (clob.ok && clob.data) return clob;
+        const src = first.ok ? first : inclClosed;
+        if (!src.ok) return src;
+        return ok(null, { url: src.url, status: src.status, ms: src.ms });
+    }
+
+    /** CLOB 兜底：/markets/<conditionId> 直接给出 question/slug/tokens（含已结算的短周期市场） */
+    async getClobMarket(conditionId: string): Promise<Result<GammaMarket | null>> {
+        const url = `${POLYMARKET.clob}/markets/${encodeURIComponent(conditionId)}`;
+        const r = await this.http.getJson(url, 'clob/markets');
+        if (!r.ok) return r;
+        try {
+            const d = (typeof r.data === 'object' && r.data !== null ? r.data : {}) as Record<string, unknown>;
+            const rawTokens = Array.isArray(d.tokens) ? (d.tokens as Record<string, unknown>[]) : [];
+            const market: GammaMarket = {
+                conditionId: String(d.condition_id ?? conditionId),
+                slug: typeof d.market_slug === 'string' && d.market_slug ? d.market_slug : undefined,
+                question: typeof d.question === 'string' && d.question ? d.question : undefined,
+                eventSlug: undefined,
+                negRisk: typeof d.neg_risk === 'boolean' ? d.neg_risk : null,
+                closed: typeof d.closed === 'boolean' ? d.closed : null,
+                endDate: typeof d.end_date_iso === 'string' ? d.end_date_iso : undefined,
+                tokens: rawTokens
+                    .map((t, i) => ({ tokenId: String(t.token_id ?? ''), outcome: String(t.outcome ?? ''), outcomeIndex: i }))
+                    .filter((t) => t.tokenId !== ''),
+                volume24hr: null,
+                liquidity: null,
+            };
+            if (!market.question) return ok(null, { url, status: r.status, ms: r.ms });
+            return ok(market, { url, status: r.status, ms: r.ms });
+        } catch (e) { return this.contractErr(e, url, r.ms); }
+    }
+
     async getMarketBySlug(slug: string): Promise<Result<GammaMarket | null>> {
         const evUrl = `${POLYMARKET.gamma}/events?slug=${encodeURIComponent(slug)}`;
         const ev = await this.http.getJson(evUrl, 'gamma/events');

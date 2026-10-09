@@ -83,7 +83,7 @@ export interface Config {
         /** 单条告警冷却（分钟）：同一钱包/市场/行为过程 */
         alertCooldownMinutes: number;
     };
-    push: { maxPerMinute: number; maxPerDay: number; maxPerCycleAlerts: number; maxAttempts: number; retryBackoffSeconds: number[] };
+    push: { maxPerMinute: number; maxPerDay: number; maxHighPerDay: number; maxPerCycleAlerts: number; maxAttempts: number; retryBackoffSeconds: number[] };
     /** 历史补全：只有在实现了可核验的补充来源后才打开 */
     backfill: { enabled: boolean };
     logLevel: 'debug' | 'info' | 'warn' | 'error';
@@ -135,7 +135,9 @@ export function loadConfig(): Config {
         push: {
             maxPerMinute: envNum('MAX_ALERTS_PER_MIN', 6),
             // 日上限是防刷屏的硬闸：超过后不再即时推送，全部并入当日摘要，次日只发一条汇总
-            maxPerDay: envNum('MAX_ALERTS_PER_DAY', 8),
+            maxPerDay: envNum('MAX_ALERTS_PER_DAY', 24),
+            // 高优先级独立预算：high 不被普通日上限挤掉，但仍有自己的硬顶（默认 20 条/天）
+            maxHighPerDay: envNum('MAX_HIGH_PER_DAY', 20),
             // 每轮最多入队几条（优先高优先级），其余事件照常记录但不推送
             maxPerCycleAlerts: envNum('MAX_ALERTS_PER_CYCLE', 4),
             maxAttempts: envNum('PUSH_MAX_ATTEMPTS', 5),

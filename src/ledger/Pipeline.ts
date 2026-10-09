@@ -201,6 +201,7 @@ export class LedgerPipeline {
             w, changes.length ? changes[0].change.eventAt : nowIso(),
         );
         let eventsCreated = 0; const eventIds: number[] = []; let queued = 0; let alertsSuppressed = 0;
+        const pushRows: BehaviorRow[] = [];
         for (const c of changes.slice().sort((x, y) => Date.parse(x.change.eventAt) - Date.parse(y.change.eventAt))) {
             const notional = c.change.deltaSize !== null && c.price !== null ? mul(c.change.deltaSize < 0n ? -c.change.deltaSize : c.change.deltaSize, c.price) : null;
             const relative = notional !== null && typical !== null && typical !== 0n ? div(notional, typical) : null;
@@ -246,23 +247,35 @@ export class LedgerPipeline {
                     if (r2.inserted) { eventsCreated++; eventIds.push(r2.id); }
                 }
             }
-            // 入队（影子模式下由 no-op 发送器接管，状态机照常走）
+            // 收集本轮要推送的事件（同一钱包合并成一条卡片，避免单个钱包刷屏）
             const row = this.repos.db.get<BehaviorRow>('SELECT * FROM behavior_events WHERE dedupe_key=?', out.dedupeKey);
-            if (row && out.priority !== 'low') {
-                if (this.cycleEnqueued >= this.deps.config.push.maxPerCycleAlerts) {
-                    // 每轮入队上限：事件照常记录，只是不推送，避免一轮就把消息打满
-                    alertsSuppressed++;
-                } else {
-                    const rep = this.reports.behaviorReport(row, { shadow: this.deps.config.shadowMode });
-                    const enq = this.deps.outbox.enqueueReport(out.dedupeKey, {
-                        chatId: this.deps.config.telegram.chatIds[0] ?? '',
-                        title: rep.title, body: rep.body, eventId: row.id, wallet: w,
-                        conditionId: out.conditionId, priority: out.priority, dataQuality: out.dataQuality,
-                    });
-                    if (enq.inserted) { queued++; this.cycleEnqueued++; }
-                }
-            } else if (row && out.priority === 'low') {
-                alertsSuppressed++;
+            if (row) {
+                if (out.priority === 'low') alertsSuppressed++;
+                else pushRows.push(row);
+            }
+        }
+
+        // ---- 4b. 推送：市场元数据 + 单钱包聚合卡片 ----
+        if (pushRows.length) {
+            // 报告必须有市场维度：先补齐市场元数据（每市场一次；有预算才发请求；失败不阻断推送）
+            const cids = [...new Set(pushRows.map((r) => r.condition_id).filter((x): x is string => !!x))].slice(0, 3);
+            for (const cid of cids) {
+                try { await this.deps.collector.ensureMarketMeta(cid); } catch { /* 报告里会写明市场信息缺失 */ }
+            }
+            if (this.cycleEnqueued >= this.deps.config.push.maxPerCycleAlerts) {
+                alertsSuppressed += pushRows.length;
+            } else {
+                const rep = this.reports.walletCycleReport(pushRows, { shadow: this.deps.config.shadowMode });
+                const topPriority = pushRows.some((r) => r.priority === 'high') ? 'high'
+                    : (pushRows.some((r) => r.priority === 'medium') ? 'medium' : 'low');
+                const first = pushRows[0], last = pushRows[pushRows.length - 1];
+                const enq = this.deps.outbox.enqueueReport(`cycle|${w}|${first.id}-${last.id}`, {
+                    chatId: this.deps.config.telegram.chatIds[0] ?? '',
+                    title: rep.title, body: rep.body, eventId: first.id, wallet: w,
+                    conditionId: first.condition_id ?? undefined, priority: topPriority,
+                    dataQuality: first.data_quality, digestLines: rep.digestLines,
+                });
+                if (enq.inserted) { queued++; this.cycleEnqueued++; }
             }
         }
 

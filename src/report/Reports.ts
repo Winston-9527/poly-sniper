@@ -9,6 +9,7 @@ import { Repos } from '../db/repos.js';
 import { Config } from '../config.js';
 import { decToString, fromDb, parseDec, pctString, decToNumber, mul, sumDec } from '../util/decimal.js';
 import { toDisplay, durationText, nowIso, unixToIso } from '../util/time.js';
+import { fmtUsd, fmtQty, fmtPct, fmtCompactUsd } from '../util/format.js';
 import { Profiler, ProfileMetrics } from '../ledger/Profiler.js';
 import { DataQuality, Priority } from '../ledger/Behaviors.js';
 
@@ -47,6 +48,47 @@ export class Reports {
 
     private link(text: string, url: string): string { return `<a href="${escapeHtml(url)}">${escapeHtml(text)}</a>`; }
 
+    // ---------- 市场维度（方案 §9.1：报告必须有市场信息） ----------
+
+    /** 市场页链接：优先 slug（market），退而用 event_slug；都没有则返回 null（不伪造链接） */
+    private marketUrl(market?: { slug: string | null; event_slug: string | null } | undefined): string | null {
+        if (!market) return null;
+        if (market.slug) return `https://polymarket.com/market/${market.slug}`;
+        if (market.event_slug) return `https://polymarket.com/event/${market.event_slug}`;
+        return null;
+    }
+
+    /** 市场背景：24h 成交量、流动性、该 token 现价与结束时间（缺失写「未知」，不猜 0） */
+    private marketBackgroundLines(conditionId: string | null, tokenId: string | null, wallet: string): string[] {
+        if (!conditionId) return [];
+        const obs = this.repos.latestMarketObservation(conditionId);
+        const market = this.repos.market(conditionId);
+        const snap = tokenId ? this.repos.snapshotForToken(wallet, tokenId) : undefined;
+        const parts: string[] = [];
+        parts.push(obs ? `24h 成交量 ${fmtCompactUsd(obs.volume_24h)}` : '24h 成交量 未知');
+        parts.push(obs ? `流动性 ${fmtCompactUsd(obs.liquidity)}` : '流动性 未知');
+        if (snap?.price) parts.push(`该 token 现价 ${fmtQty(snap.price)}`);
+        if (market?.end_date) parts.push(`结束 ${String(market.end_date).slice(0, 10)}`);
+        if (market?.closed === 1) parts.push('状态 已关闭');
+        const lines = [`${parts.join('｜')}`];
+        if (!market?.question) {
+            lines.push('⚠️ 市场标题未取到（这是数据缺口：只能用 conditionId 定位，不代表该市场无数据）');
+        }
+        return lines;
+    }
+
+    /** 事件一行摘要（合并摘要与卡片共用）：市场名｜钱包短地址｜金额（%）｜优先级 */
+    descriptor(e: BehaviorRow): string {
+        const mag = JSON.parse(e.magnitude ?? '{}') as Magnitude;
+        const market = e.condition_id ? this.repos.market(e.condition_id) : undefined;
+        const name = market?.question ?? (e.condition_id ? `condition ${e.condition_id.slice(0, 10)}…` : '市场未知');
+        const delta = mag.delta === null || mag.delta === undefined ? null : Number(mag.delta);
+        const sign = delta !== null && delta < 0 ? '-' : '+';
+        const amt = mag.notional ? `${sign}${fmtUsd(mag.notional)}` : '金额未知';
+        const pct = mag.pct ? `（${fmtPct(mag.pct)}）` : '';
+        return `${String(name).slice(0, 46)}｜${e.wallet.slice(0, 6)}…${e.wallet.slice(-4)}｜${amt}${pct}｜${PRIORITY_LABEL[e.priority] ?? e.priority}`;
+    }
+
     /** 行为告警报告（方案 §9.1 的落地） */
     behaviorReport(e: BehaviorRow, opts: { shadow?: boolean } = {}): { title: string; body: string } {
         const mag = JSON.parse(e.magnitude ?? '{}') as Magnitude;
@@ -65,8 +107,12 @@ export class Reports {
         const before = mag.before ?? '未知', after = mag.after ?? '未知';
         lines.push(`市场：${escapeHtml(String(question))}`);
         lines.push(`结果：${escapeHtml(String(outcome))}`);
-        lines.push(`份数：${escapeHtml(String(before))} → ${escapeHtml(String(after))}（变化 ${escapeHtml(String(mag.delta ?? '未知'))}${mag.pct ? '，' + escapeHtml(mag.pct) : ''}）`);
-        if (mag.notional) lines.push(`名义金额估算：$${escapeHtml(mag.notional)}（按该 token 自身价格，本报告不使用另一边的价格）`);
+        for (const l of this.marketBackgroundLines(e.condition_id, e.token_id, wallet)) lines.push(escapeHtml(l));
+        lines.push(`份数：${fmtQty(String(before))} → ${fmtQty(String(after))}（变化 ${fmtQty(String(mag.delta ?? '未知'))}${mag.pct ? '，' + fmtPct(mag.pct) : ''}）`);
+        if (mag.notional) {
+            const signed = Number(mag.delta ?? 0) < 0 ? `-${fmtUsd(mag.notional)}` : `+${fmtUsd(mag.notional)}`;
+            lines.push(`名义金额估算：${signed}（按该 token 自身价格，本报告不使用另一边的价格）`);
+        }
         if (e.event_type === 'position_exited') lines.push(`说明：这是<b>本地址</b>在该 token 上观察到的份数归零；不能据此断言某个自然人全部退出，也不排除外部对冲。`);
         if (e.event_type === 'position_reduced') lines.push(`说明：减仓不自动解释为止盈或止损，也不因为卖出金额更大就判定为反手/对冲。`);
         lines.push('');
@@ -95,24 +141,110 @@ export class Reports {
         lines.push(`事件时间：${escapeHtml(toDisplay(e.event_at))}｜采集时间：${escapeHtml(toDisplay(e.observed_at))}`);
         lines.push(`持仓过程：episode ${escapeHtml(String(ev.episodeId ?? '?'))}，账本条目 ${escapeHtml(JSON.stringify(ev.ledgerEntryIds ?? []))}`);
         lines.push(`规则版本：${escapeHtml(e.rule_version)}（阈值是可配置假设，影子运行后再调整）`);
-        if (market?.slug) lines.push(this.link('Polymarket 市场页', `https://polymarket.com/event/${market.slug}`));
+        const mUrl = this.marketUrl(market);
+        if (mUrl) lines.push(this.link(market?.slug ? 'Polymarket 市场页' : 'Polymarket 事件页', mUrl));
+        else if (market) lines.push('市场页链接未取到（缺 slug；已尝试用活动里的 slug 补齐）');
         lines.push(this.link('链上地址', `https://polygonscan.com/address/${wallet}`));
         return { title: `${eventLabel(e.event_type)} · ${String(question).slice(0, 40)}`, body: lines.join('\n') };
+    }
+
+    /**
+     * 一个钱包一轮内的多个事件合并成一张卡片（方案 §9.1）：事件逐行列出，背景/缺口/证据只出现一次。
+     * 只有 1 条事件时退回单事件报告（格式不变），但同样返回合并摘要用的 digestLines。
+     */
+    walletCycleReport(rows: BehaviorRow[], opts: { shadow?: boolean } = {}): { title: string; body: string; digestLines: string[] } {
+        const digestLines = rows.map((r) => this.descriptor(r));
+        if (!rows.length) return { title: '（无事件）', body: '', digestLines };
+        if (rows.length === 1) {
+            const one = this.behaviorReport(rows[0], opts);
+            return { title: one.title, body: one.body, digestLines };
+        }
+        const sorted = [...rows].sort((a, b) => Date.parse(a.event_at) - Date.parse(b.event_at));
+        const wallet = sorted[0].wallet;
+        const marks = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩'];
+        const lines: string[] = [];
+        lines.push(`<b>钱包动态 · ${sorted.length} 个事件</b>${opts.shadow ? '  <i>[影子模式]</i>' : ''}`);
+        lines.push('');
+        sorted.forEach((e, i) => lines.push(...this.eventCardLines(e, marks[i] ?? `(${i + 1})`)));
+        lines.push('');
+        lines.push('<b>背景</b>');
+        lines.push(`钱包：${this.link(wallet.slice(0, 10) + '…' + wallet.slice(-6), `https://polygonscan.com/address/${wallet}`)}`);
+        const profile = this.profiler.build(wallet, { windowsDays: this.config.rules.baselineWindowsDays });
+        lines.push(this.profileLine(profile));
+        const pos = this.positionLine(wallet, 3);
+        if (pos) lines.push(`${pos}（最多显示 3 项，完整组合见 /wallet）`);
+        const sib = this.repos.siblingsByOwner(wallet);
+        lines.push(sib.length ? `控制关系：与 ${sib.length} 个地址共享同一 owner（仅记录证据，不合并身份）` : '控制关系：未取到可核验的 owner（未知，不等于无关联）');
+        lines.push('');
+        const byPriority = { high: 0, medium: 0, low: 0 } as Record<string, number>;
+        for (const e of sorted) byPriority[e.priority] = (byPriority[e.priority] ?? 0) + 1;
+        const prioText = (['high', 'medium', 'low'] as const).filter((p) => byPriority[p]).map((p) => `${PRIORITY_LABEL[p]} ${byPriority[p]}`).join(' / ');
+        const quality = sorted.some((e) => e.data_quality === 'incomplete') ? 'incomplete' : (sorted.some((e) => e.data_quality === 'partial') ? 'partial' : 'verified');
+        lines.push(`<b>数据完整度</b>：优先级 ${prioText}｜质量 ${qualityLabel(quality)}（优先级与数据质量分开判断）`);
+        const gapSeen = new Set<string>();
+        const gaps = this.repos.openGaps(50).filter((g) => {
+            const key = String(g.key);
+            if (key !== wallet && !sorted.some((e) => e.condition_id && String(e.condition_id) === key)) return false;
+            const sig = `${g.reason}|${String(g.detail ?? '').slice(0, 60)}`;
+            if (gapSeen.has(sig)) return false;
+            gapSeen.add(sig);
+            return true;
+        });
+        if (gaps.length) {
+            lines.push(`已知缺口（去重后 ${gaps.length}，同一缺口不再逐条重复）：`);
+            for (const g of gaps.slice(0, 5)) lines.push(`• ${escapeHtml(String(g.reason))}：${escapeHtml(String(g.detail ?? '').slice(0, 120))}`);
+        } else {
+            lines.push('已知缺口：本报告涉及的钱包/市场当前没有登记的缺口（表示「已获取区间内未发现」，不表示「一定没有」）');
+        }
+        lines.push('');
+        lines.push(`<b>证据</b>`);
+        lines.push(`事件时间：${escapeHtml(toDisplay(sorted[0].event_at))} → ${escapeHtml(toDisplay(sorted[sorted.length - 1].event_at))}｜采集时间：${escapeHtml(toDisplay(sorted[sorted.length - 1].observed_at))}`);
+        lines.push(`规则版本：${escapeHtml(sorted[sorted.length - 1].rule_version)}（阈值是可配置假设，影子运行后再调整）`);
+        for (const [, e] of new Map(sorted.map((e) => [e.condition_id ?? '', e])).entries()) {
+            const market = e.condition_id ? this.repos.market(e.condition_id) : undefined;
+            const url = this.marketUrl(market);
+            const name = market?.question ? String(market.question).slice(0, 40) : (e.condition_id ? `condition ${e.condition_id.slice(0, 10)}…` : '市场未知');
+            lines.push(url ? this.link(`市场页：${name}`, url) : `市场页未取到（${name}）`);
+        }
+        lines.push(this.link('链上地址', `https://polygonscan.com/address/${wallet}`));
+        return { title: `钱包动态 · ${sorted.length} 个事件 · ${wallet.slice(0, 8)}…`, body: lines.join('\n'), digestLines };
+    }
+
+    /** 卡片里单个事件的两行（第一行行为+金额，第二行市场背景） */
+    private eventCardLines(e: BehaviorRow, mark: string): string[] {
+        const mag = JSON.parse(e.magnitude ?? '{}') as Magnitude;
+        const market = e.condition_id ? this.repos.market(e.condition_id) : undefined;
+        const name = market?.question ?? (e.condition_id ? `condition ${e.condition_id.slice(0, 10)}…` : '市场未知');
+        const url = this.marketUrl(market);
+        const label = escapeHtml(eventLabel(e.event_type));
+        const outcome = mag.outcome ?? '?';
+        const head = url
+            ? `${mark} <b>${label}</b>｜${this.link(String(name).slice(0, 46), url)}（${escapeHtml(String(outcome))}）`
+            : `${mark} <b>${label}</b>｜${escapeHtml(String(name).slice(0, 46))}（${escapeHtml(String(outcome))}）`;
+        const deltaNum = Number(mag.delta ?? 0);
+        const amount = mag.notional ? `${deltaNum < 0 ? '-' : '+'}${fmtUsd(mag.notional)}` : '金额未知';
+        const pct = mag.pct ? `（${fmtPct(mag.pct)}）` : '';
+        const first = `${head}｜${amount}${pct}｜${qualityLabel(e.data_quality)}`;
+        const bg = this.marketBackgroundLines(e.condition_id, e.token_id, e.wallet).filter((l) => !l.startsWith('⚠️'));
+        const second = `   份数 ${fmtQty(mag.before ?? '未知')} → ${fmtQty(mag.after ?? '未知')}${bg.length ? '｜' + bg[0] : ''}`;
+        const extra = this.marketBackgroundLines(e.condition_id, e.token_id, e.wallet).some((l) => l.startsWith('⚠️'))
+            ? [`   ⚠️ 市场标题未取到（数据缺口，不代表该市场没有数据）`] : [];
+        return [first, second, ...extra];
     }
 
     private profileLine(p: ProfileMetrics): string {
         return `活跃历史：${escapeHtml(this.profiler.describeActivityHistory(p))}`;
     }
 
-    private positionLine(wallet: string): string | null {
+    private positionLine(wallet: string, limit = 5): string | null {
         const snaps = this.repos.latestPositionSnapshots(wallet);
         if (!snaps.length) return '当前组合：没有取到持仓快照（是「未知」，不是「空仓」）';
         const parts: string[] = [];
-        for (const s of snaps.slice(0, 5)) {
+        for (const s of snaps.slice(0, limit)) {
             const size = fromDb(s.size as string | null);
             const price = fromDb(s.price as string | null);
             const value = size !== null && price !== null ? mul(size, price) : null;
-            parts.push(`${String(s.outcome ?? '?')} ${decToString(size) ?? '未知'} 份 @ ${decToString(price) ?? '未知'}${value ? ` = $${decToString(value)}` : ''}`);
+            parts.push(`${String(s.outcome ?? '?')} ${fmtQty(decToString(size))} 份 @ ${fmtQty(decToString(price))}${value ? ` = ${fmtUsd(decToString(value))}` : ''}`);
         }
         return `当前组合（按各 token 自身价格）：${parts.join('；')}`;
     }

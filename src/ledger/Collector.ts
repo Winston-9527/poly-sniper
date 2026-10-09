@@ -249,23 +249,48 @@ export class Collector {
         return { status: 'verified', owners: e.owners ?? (e.owner ? [e.owner] : []), threshold: e.threshold, siblings: this.repos.siblingsByOwner(w) };
     }
 
+    /**
+     * 补齐市场元数据（question / slug / 24h 量 / 流动性）。
+     * 顺序：① 用活动自带的 slug 免费补；② 元数据缺失或观察过期才发请求（受请求预算约束）。
+     * 返回 true 表示「现在报告里能拿到市场标题」。
+     */
+    async ensureMarketMeta(conditionId: string, opts: { maxAgeMinutes?: number } = {}): Promise<boolean> {
+        const maxAge = opts.maxAgeMinutes ?? 180;
+        const before = this.repos.market(conditionId);
+        if (before && !before.slug) {
+            const s = this.repos.marketSlugFor(conditionId);
+            if (s && (s.market_slug || s.event_slug)) {
+                this.repos.upsertMarket({ conditionId, slug: s.market_slug ?? undefined, eventSlug: s.event_slug ?? undefined });
+            }
+        }
+        const cur = this.repos.market(conditionId);
+        const obs = this.repos.latestMarketObservation(conditionId);
+        const ageMin = obs?.observed_at ? (Date.now() - Date.parse(obs.observed_at)) / 60_000 : Number.POSITIVE_INFINITY;
+        if (cur?.question && ageMin <= maxAge) return true;
+        const r = await this.observeMarket(conditionId);
+        return r.ok;
+    }
+
     // ---------------- 候选发现 ----------------
 
     /** 市场观察：市场元数据 + 价格/成交量背景 */
     async observeMarket(conditionId: string): Promise<{ ok: boolean; question?: string; tokens: { tokenId: string; outcome: string }[]; error?: string }> {
-        const r = await this.deps.dataApi.getMarkets(`condition_ids=${encodeURIComponent(conditionId)}`);
+        const r = await this.deps.dataApi.getMarketByCondition(conditionId);
         if (!r.ok) {
             this.repos.addGap('market', conditionId, r.kind === 'contract' ? 'contract_mismatch' : 'query_failed', `市场元数据失败：${r.error}`);
             return { ok: false, error: r.error, tokens: [] };
         }
-        const m = r.data[0];
+        const m = r.data;
         if (!m) {
-            this.repos.addGap('market', conditionId, 'query_failed', '市场元数据为空（不是「没有异动」，是查不到）');
+            this.repos.addGap('market', conditionId, 'query_failed', '市场元数据为空（gamma 默认/closed/CLOB 三条路都查不到，不是「没有异动」）');
             return { ok: false, error: 'no market', tokens: [] };
         }
         this.repos.upsertMarket({ conditionId: m.conditionId, slug: m.slug, question: m.question, negRisk: m.negRisk, closed: m.closed, endDate: m.endDate });
         for (const t of m.tokens) this.repos.upsertOutcomeToken({ tokenId: t.tokenId, conditionId: m.conditionId, outcome: t.outcome, outcomeIndex: t.outcomeIndex });
         this.repos.insertMarketObservation({ conditionId: m.conditionId, price: null, volume24h: m.volume24hr, liquidity: m.liquidity, observedAt: nowIso() });
+        if (!m.question || m.question === '') {
+            this.repos.addGap('market', conditionId, 'incomplete_record', '市场标题缺失（元数据源没给 question）');
+        }
         return { ok: true, question: m.question, tokens: m.tokens.map((t) => ({ tokenId: t.tokenId, outcome: t.outcome })) };
     }
 

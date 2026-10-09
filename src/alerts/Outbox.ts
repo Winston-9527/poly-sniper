@@ -19,6 +19,8 @@ export interface AlertPayload {
     conditionId?: string;
     priority?: string;
     dataQuality?: string;
+    /** 每个被合并事件一行（市场名｜钱包短｜金额（%）｜优先级），供摘要按市场归并 */
+    digestLines?: string[];
 }
 
 export interface SendResult { ok: boolean; messageId?: string; error?: string; }
@@ -52,7 +54,8 @@ export class AlertOutbox {
         return n;
     }
 
-    /** 投递到期条目，受「每分钟限速」与「每日上限」双重约束（防刷屏） */
+    /** 投递到期条目，受「每分钟限速」与「每日上限」双重约束（防刷屏）。
+     *  高优先级另有独立预算（maxHighPerDay）：不被普通日上限挤掉，但也不会无限刷。 */
     async flush(now = new Date()): Promise<FlushReport> {
         const report: FlushReport = { sent: 0, failed: 0, retried: 0, dead: 0, merged: 0, deferredByRateLimit: 0, details: [] };
         const nowIsoStr = now.toISOString();
@@ -61,12 +64,18 @@ export class AlertOutbox {
         // 日上限：超过后不再即时推送，全部并入「当日摘要」，次日只发一条汇总
         const dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
         let dayBudget = Math.max(0, this.config.push.maxPerDay - this.repos.sentSince(dayStart));
+        let highBudget = Math.max(0, (this.config.push.maxHighPerDay ?? 0) - this.repos.sentHighSince(dayStart));
 
         const due = this.repos.dueAlerts(nowIsoStr, this.config.push.maxPerMinute * 10);
         for (const row of due) {
             const id = Number(row.id);
-            if (budget <= 0 || dayBudget <= 0) {
-                const overDay = dayBudget <= 0;
+            let payload: AlertPayload;
+            try { payload = JSON.parse(String(row.payload)) as AlertPayload; }
+            catch { payload = { chatId: '', title: '（无法解析）', body: '' }; }
+            const isHigh = String(payload.priority ?? '') === 'high';
+            const dayBlocked = dayBudget <= 0 && !(isHigh && highBudget > 0);
+            if (budget <= 0 || dayBlocked) {
+                const overDay = dayBlocked;
                 const digestId = overDay ? this.dayDigestFor(now) : this.digestFor(now);
                 this.repos.mergeAlert(id, digestId, nowIsoStr);
                 report.merged++;
@@ -74,8 +83,7 @@ export class AlertOutbox {
                 if (overDay) report.details.push(`已达日上限 ${this.config.push.maxPerDay} 条，合并进当日摘要（次日发送）`);
                 continue;
             }
-            const payload = JSON.parse(String(row.payload)) as AlertPayload;
-            // 摘要类条目在发送前用当前被合并的标题刷新正文
+            // 摘要类条目在发送前用当前被合并的标题/正文刷新
             if (String(row.dedupe_key ?? '').startsWith('digest')) {
                 payload.body = this.renderDigest(id);
                 payload.title = this.digestTitle(id) ?? payload.title;
@@ -84,7 +92,9 @@ export class AlertOutbox {
             const res = await this.sender(payload.chatId, payload.body);
             if (res.ok) {
                 this.repos.markAlertSent(id, res.messageId ?? null, nowIsoStr);
-                budget--; dayBudget--;
+                budget--;
+                if (isHigh && dayBudget <= 0) highBudget--;
+                else dayBudget--;
                 report.sent++;
             } else {
                 const attempts = Number(row.attempts ?? 0);
@@ -127,7 +137,7 @@ export class AlertOutbox {
         const payload: AlertPayload = {
             chatId: this.config.telegram.chatIds[0] ?? '',
             title: `当日汇总（${day}）：已达日上限`,
-            body: '当日推送已达上限，其余告警并入本条汇总。',
+            body: '当日即时推送已达上限；本条在次日 00:05 后发送，正文会列出被合并的告警（按市场归并）。',
         };
         const id = this.repos.enqueueAlert(key, JSON.stringify(payload)).id;
         // 次日 00:05（UTC）之后才到期
@@ -144,28 +154,60 @@ export class AlertOutbox {
         return n ? `合并摘要：${n} 条告警` : null;
     }
 
-    private mergedChildren(digestId: number): { title: string; body: string }[] {
+    private mergedChildren(digestId: number): { title: string; body: string; digestLines: string[]; market?: string }[] {
         const rows = this.repos.db.all<{ payload: string }>('SELECT payload FROM alert_outbox WHERE merged_into=? ORDER BY created_at', digestId);
         return rows.map((r) => {
             try {
                 const p = JSON.parse(r.payload) as AlertPayload;
-                return { title: p.title ?? '（无标题）', body: p.body ?? '' };
-            } catch { return { title: '（无法解析）', body: '' }; }
+                return { title: p.title ?? '（无标题）', body: p.body ?? '', digestLines: Array.isArray(p.digestLines) ? p.digestLines : [] };
+            } catch { return { title: '（无法解析）', body: '', digestLines: [] }; }
         });
     }
 
-    /** 把已合并条目的标题写进摘要正文（发送前调用） */
+    /**
+     * 把被合并条目渲染成有内容的摘要（发送前调用）：
+     * 按市场归并，每行「钱包｜金额（变化%）｜优先级」，而不是只列标题。
+     */
     renderDigest(digestId: number): string {
         const children = this.mergedChildren(digestId);
-        const head = `被合并的告警（${children.length} 条）：`;
-        const shown = children.slice(0, 30).map((c) => `• ${c.title}`);
-        if (children.length > 30) shown.push(`…另有 ${children.length - 30} 条`);
+        const groups = new Map<string, string[]>();
+        const fallback: string[] = [];
+        let shown = 0;
+        const MAX_LINES = 40;
+        for (const c of children) {
+            if (!c.digestLines.length) { fallback.push(c.title); continue; }
+            for (const line of c.digestLines) {
+                const cut = line.indexOf('｜');
+                const market = cut > 0 ? line.slice(0, cut) : '（市场未知）';
+                const rest = cut > 0 ? line.slice(cut + 1) : line;
+                const arr = groups.get(market) ?? [];
+                arr.push(rest);
+                groups.set(market, arr);
+            }
+        }
+        const lines: string[] = [`被合并的告警（${children.length} 条）：按市场归并，每行「钱包｜金额（变化%）｜优先级」`];
+        for (const [market, items] of groups) {
+            if (shown >= MAX_LINES) break;
+            lines.push(`▸ ${market}`);
+            for (const it of items.slice(0, 6)) {
+                lines.push(`  · ${it}`);
+                shown++;
+                if (shown >= MAX_LINES) break;
+            }
+            if (items.length > 6) lines.push(`  · …另有 ${items.length - 6} 条同类`);
+        }
+        if (fallback.length) {
+            lines.push('▸ 其他（缺市场信息）');
+            for (const t of fallback.slice(0, 10)) lines.push(`  · ${t}`);
+        }
+        if (shown >= MAX_LINES) lines.push(`（其余已折叠；完整记录在库里，可用 /status 查看队列）`);
+        lines.push('金额为按该 token 自身价格的估算；「未知」不等于 0。');
         const payload: AlertPayload = {
             chatId: this.config.telegram.chatIds[0] ?? '',
             title: this.digestTitle(digestId) ?? '合并摘要',
-            body: [head, ...shown].join('\n'),
+            body: lines.join('\n'),
         };
-        this.repos.updateAlertPayload(digestId, JSON.stringify(payload));
+        this.repos.updateAlertPayload(digestId, JSON.stringify({ ...payload, digestLines: [] }));
         return payload.body;
     }
 

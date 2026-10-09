@@ -116,8 +116,30 @@ export class Repos {
         );
     }
 
-    market(conditionId: string): { question: string | null; slug: string | null; event_slug: string | null; neg_risk: number | null } | undefined {
-        return this.db.get('SELECT question, slug, event_slug, neg_risk FROM markets WHERE condition_id=?', conditionId);
+    market(conditionId: string): { question: string | null; slug: string | null; event_slug: string | null; neg_risk: number | null; closed: number | null; end_date: string | null } | undefined {
+        return this.db.get('SELECT question, slug, event_slug, neg_risk, closed, end_date FROM markets WHERE condition_id=?', conditionId);
+    }
+
+    /** 市场最近一次观察（成交量/流动性背景）：报告里的市场维度来自这里 */
+    latestMarketObservation(conditionId: string): { volume_24h: string | null; liquidity: string | null; observed_at: string } | undefined {
+        return this.db.get('SELECT volume_24h, liquidity, observed_at FROM market_observations WHERE condition_id=? ORDER BY observed_at DESC LIMIT 1', conditionId);
+    }
+
+    /** 活动里自带的 slug（来源免费提供）：用于补齐 markets 缺失的 slug，不额外发请求 */
+    marketSlugFor(conditionId: string): { market_slug: string | null; event_slug: string | null } | undefined {
+        return this.db.get(
+            `SELECT market_slug, event_slug FROM wallet_activities
+             WHERE condition_id=? AND (market_slug IS NOT NULL OR event_slug IS NOT NULL)
+             ORDER BY event_at DESC LIMIT 1`, conditionId,
+        );
+    }
+
+    /** 某钱包某 token 的最近快照（报告里的「现价/现值」来自这里，不用另一边的价格） */
+    snapshotForToken(wallet: string, tokenId: string): { price: string | null; size: string | null; current_value: string | null; snapshot_at: string } | undefined {
+        return this.db.get(
+            'SELECT price, size, current_value, snapshot_at FROM position_snapshots WHERE wallet=? AND token_id=? ORDER BY snapshot_at DESC LIMIT 1',
+            wallet, tokenId,
+        );
     }
 
     token(tokenId: string): { condition_id: string; outcome: string | null; outcome_index: number | null } | undefined {
@@ -491,6 +513,14 @@ export class Repos {
     /** 最近一分钟发送计数（限速依据） */
     sentSince(iso: string): number {
         const r = this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM alert_outbox WHERE status='sent' AND updated_at >= ?`, iso);
+        return r?.n ?? 0;
+    }
+
+    /** 今日已发送的高优先级条数：高优先级走独立预算（不被日上限挤掉），但有独立硬顶 */
+    sentHighSince(iso: string): number {
+        const r = this.db.get<{ n: number }>(
+            `SELECT COUNT(*) AS n FROM alert_outbox WHERE status='sent' AND updated_at >= ? AND payload LIKE '%"priority":"high"%'`, iso,
+        );
         return r?.n ?? 0;
     }
 
