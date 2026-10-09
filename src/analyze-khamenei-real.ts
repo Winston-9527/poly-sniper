@@ -46,7 +46,7 @@ async function main() {
     try {
         // Pass conditionId to bypass Gamma lookup if needed, though GammaClient should handle it now
         // Price is approx 0.105
-        const suspiciousWallets = await profiler.analyzeMarket(targetTokenId, conditionId, 0.105);
+        const { results: suspiciousWallets } = await profiler.analyzeMarket(targetTokenId, conditionId, 0.105);
 
         console.log(`\nAnalysis Complete. Found ${suspiciousWallets.length} suspicious wallets.`);
 

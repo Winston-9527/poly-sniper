@@ -33,7 +33,7 @@ async function run() {
     const infinexPrice = 0.945;
     console.log("Token ID:", infinexTokenId);
     try {
-        const results1 = await profiler.analyzeMarket(infinexTokenId, infinexConditionId, infinexPrice);
+        const { results: results1 } = await profiler.analyzeMarket(infinexTokenId, infinexConditionId, infinexPrice);
         console.log(`✅ Analysis Complete. Found ${results1.length} high-risk wallets.`);
 
         results1.forEach((r) => {
@@ -65,7 +65,7 @@ async function run() {
     const khameneiPrice = 0.095; // From JSON
 
     try {
-        const results2 = await profiler.analyzeMarket(khameneiTokenId, khameneiConditionId, khameneiPrice);
+        const { results: results2 } = await profiler.analyzeMarket(khameneiTokenId, khameneiConditionId, khameneiPrice);
         console.log(`✅ Analysis Complete. Found ${results2.length} high-risk wallets.`);
 
         results2.forEach((r) => {

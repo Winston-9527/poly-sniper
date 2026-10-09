@@ -2,6 +2,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
+    "test": "tsc && node --test tests/",
+    "scan": "node dist/tools/scan-candidates.js",
     "start": "node dist/index.js",
     "dev": "node --loader ts-node/esm src/index.ts",
     "test:manual": "node test-manual-command.js",
