@@ -1,0 +1,101 @@
+[
+  {
+    "codeLen": 146,
+    "owner": {
+      "addr": "0x4b0c7888ca22afaa2a0e94e0dfd43f4e5379bb7b"
+    },
+    "getOwners": {
+      "unsupported": "execution reverted"
+    },
+    "threshold": {
+      "unsupported": "execution reverted"
+    }
+  },
+  {
+    "codeLen": 45,
+    "owner": {
+      "unsupported": "execution reverted"
+    },
+    "getOwners": {
+      "unsupported": "execution reverted"
+    },
+    "threshold": {
+      "unsupported": "execution reverted"
+    }
+  },
+  {
+    "codeLen": 146,
+    "owner": {
+      "addr": "0x2a5435d417af16d68d1a596ebe5ca3e628ef9a3d"
+    },
+    "getOwners": {
+      "unsupported": "execution reverted"
+    },
+    "threshold": {
+      "unsupported": "execution reverted"
+    }
+  },
+  {
+    "codeLen": 124,
+    "owner": {
+      "unsupported": "execution reverted"
+    },
+    "getOwners": {
+      "n": 3,
+      "addresses": 3
+    },
+    "threshold": {
+      "value": 1
+    }
+  },
+  {
+    "codeLen": 124,
+    "owner": {
+      "unsupported": "execution reverted"
+    },
+    "getOwners": {
+      "n": 3,
+      "addresses": 3
+    },
+    "threshold": {
+      "value": 1
+    }
+  },
+  {
+    "codeLen": 124,
+    "owner": {
+      "unsupported": "execution reverted"
+    },
+    "getOwners": {
+      "n": 3,
+      "addresses": 3
+    },
+    "threshold": {
+      "value": 1
+    }
+  },
+  {
+    "codeLen": 45,
+    "owner": {
+      "unsupported": "execution reverted"
+    },
+    "getOwners": {
+      "unsupported": "execution reverted"
+    },
+    "threshold": {
+      "unsupported": "execution reverted"
+    }
+  },
+  {
+    "codeLen": 45,
+    "owner": {
+      "unsupported": "execution reverted"
+    },
+    "getOwners": {
+      "unsupported": "execution reverted"
+    },
+    "threshold": {
+      "unsupported": "execution reverted"
+    }
+  }
+]

@@ -1,0 +1,250 @@
+/**
+ * 报告渲染（方案 §9）。规则：
+ *   - 先给行为与背景，再给证据和限制；「事实 / 推断 / 缺失」分开写。
+ *   - 不把「没有观察到」改写成「没有发生」。
+ *   - Telegram HTML 模式：动态内容只转义 & < >（方案 §10）。
+ *   - 时间展示用东八区并注明。
+ */
+import { Repos } from '../db/repos.js';
+import { Config } from '../config.js';
+import { decToString, fromDb, parseDec, pctString, decToNumber, mul, sumDec } from '../util/decimal.js';
+import { toDisplay, durationText, nowIso, unixToIso } from '../util/time.js';
+import { Profiler, ProfileMetrics } from '../ledger/Profiler.js';
+import { DataQuality, Priority } from '../ledger/Behaviors.js';
+
+export function escapeHtml(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+export interface Magnitude { before?: string | null; after?: string | null; delta?: string | null; pct?: string | null; notional?: string | null; cashDelta?: string | null; outcome?: string | null; }
+
+export interface BehaviorRow {
+    id: number; wallet: string; condition_id: string | null; token_id: string | null; event_type: string;
+    magnitude: string | null; evidence: string; data_quality: DataQuality; priority: Priority; priority_reason: string;
+    rule_version: string; event_at: string; observed_at: string;
+}
+
+const EVENT_LABEL: Record<string, string> = {
+    position_opened: '新出现的持仓',
+    position_increased: '显著加仓',
+    position_reduced: '部分减仓',
+    position_exited: '本地址退出（份数归零）',
+    reactivated: '沉寂后恢复活动',
+    capital_in: '资金转入（可解释部分）',
+    capital_out: '资金转出（可解释部分）',
+    unexplained_change: '未解释的份数/资金变化',
+};
+const QUALITY_LABEL: Record<string, string> = { verified: '已核对', partial: '部分核对', incomplete: '证据不足' };
+const PRIORITY_LABEL: Record<string, string> = { high: '高', medium: '中', low: '低' };
+const NOTIONAL_LABEL: Record<string, string> = { '?': '?' };
+
+export function eventLabel(t: string): string { return EVENT_LABEL[t] ?? t; }
+export function qualityLabel(q: string): string { return QUALITY_LABEL[q] ?? q; }
+
+export class Reports {
+    private profiler: Profiler;
+    constructor(private repos: Repos, private config: Config) { this.profiler = new Profiler(repos); }
+
+    private link(text: string, url: string): string { return `<a href="${escapeHtml(url)}">${escapeHtml(text)}</a>`; }
+
+    /** 行为告警报告（方案 §9.1 的落地） */
+    behaviorReport(e: BehaviorRow, opts: { shadow?: boolean } = {}): { title: string; body: string } {
+        const mag = JSON.parse(e.magnitude ?? '{}') as Magnitude;
+        const market = e.condition_id ? this.repos.market(e.condition_id) : undefined;
+        const token = e.token_id ? this.repos.token(e.token_id) : undefined;
+        const question = market?.question ?? (e.condition_id ? `condition ${e.condition_id.slice(0, 12)}…` : '（市场未知）');
+        const outcome = mag.outcome ?? token?.outcome ?? '?';
+        const wallet = e.wallet;
+        const profile = this.profiler.build(wallet, { windowsDays: this.config.rules.baselineWindowsDays });
+        const gaps = this.repos.openGaps(20).filter((g) => String(g.key) === wallet || (e.condition_id && String(g.key) === e.condition_id));
+
+        const lines: string[] = [];
+        lines.push(`<b>${escapeHtml(eventLabel(e.event_type))}</b>${opts.shadow ? '  <i>[影子模式]</i>' : ''}`);
+        lines.push('');
+        // —— 行为（事实） ——
+        const before = mag.before ?? '未知', after = mag.after ?? '未知';
+        lines.push(`市场：${escapeHtml(String(question))}`);
+        lines.push(`结果：${escapeHtml(String(outcome))}`);
+        lines.push(`份数：${escapeHtml(String(before))} → ${escapeHtml(String(after))}（变化 ${escapeHtml(String(mag.delta ?? '未知'))}${mag.pct ? '，' + escapeHtml(mag.pct) : ''}）`);
+        if (mag.notional) lines.push(`名义金额估算：$${escapeHtml(mag.notional)}（按该 token 自身价格，本报告不使用另一边的价格）`);
+        if (e.event_type === 'position_exited') lines.push(`说明：这是<b>本地址</b>在该 token 上观察到的份数归零；不能据此断言某个自然人全部退出，也不排除外部对冲。`);
+        if (e.event_type === 'position_reduced') lines.push(`说明：减仓不自动解释为止盈或止损，也不因为卖出金额更大就判定为反手/对冲。`);
+        lines.push('');
+        // —— 背景 ——
+        lines.push(`<b>背景</b>`);
+        lines.push(`钱包：${this.link(wallet.slice(0, 10) + '…' + wallet.slice(-6), `https://polygonscan.com/address/${wallet}`)}`);
+        lines.push(this.profileLine(profile));
+        const pos = this.positionLine(wallet);
+        if (pos) lines.push(pos);
+        const sib = this.repos.siblingsByOwner(wallet);
+        lines.push(sib.length ? `控制关系：与 ${sib.length} 个地址共享同一 owner（仅记录证据，不合并身份）` : `控制关系：未取到可核验的 owner（未知，不等于无关联）`);
+        lines.push(`触发原因：${escapeHtml(e.priority_reason)}`);
+        lines.push('');
+        // —— 数据完整度 ——
+        lines.push(`<b>数据完整度</b>：${qualityLabel(e.data_quality)}｜关注优先级：${PRIORITY_LABEL[e.priority] ?? e.priority}（优先级与数据质量分开判断）`);
+        if (gaps.length) {
+            lines.push(`已知缺口（${gaps.length}）：`);
+            for (const g of gaps.slice(0, 5)) lines.push(`• ${escapeHtml(String(g.reason))}：${escapeHtml(String(g.detail ?? '').slice(0, 120))}`);
+        } else {
+            lines.push('已知缺口：本报告涉及的钱包/市场当前没有登记的缺口（表示「已获取区间内未发现」，不表示「一定没有」）');
+        }
+        lines.push('');
+        // —— 证据 ——
+        const ev = JSON.parse(e.evidence ?? '{}') as Record<string, unknown>;
+        lines.push(`<b>证据</b>`);
+        lines.push(`事件时间：${escapeHtml(toDisplay(e.event_at))}｜采集时间：${escapeHtml(toDisplay(e.observed_at))}`);
+        lines.push(`持仓过程：episode ${escapeHtml(String(ev.episodeId ?? '?'))}，账本条目 ${escapeHtml(JSON.stringify(ev.ledgerEntryIds ?? []))}`);
+        lines.push(`规则版本：${escapeHtml(e.rule_version)}（阈值是可配置假设，影子运行后再调整）`);
+        if (market?.slug) lines.push(this.link('Polymarket 市场页', `https://polymarket.com/event/${market.slug}`));
+        lines.push(this.link('链上地址', `https://polygonscan.com/address/${wallet}`));
+        return { title: `${eventLabel(e.event_type)} · ${String(question).slice(0, 40)}`, body: lines.join('\n') };
+    }
+
+    private profileLine(p: ProfileMetrics): string {
+        return `活跃历史：${escapeHtml(this.profiler.describeActivityHistory(p))}`;
+    }
+
+    private positionLine(wallet: string): string | null {
+        const snaps = this.repos.latestPositionSnapshots(wallet);
+        if (!snaps.length) return '当前组合：没有取到持仓快照（是「未知」，不是「空仓」）';
+        const parts: string[] = [];
+        for (const s of snaps.slice(0, 5)) {
+            const size = fromDb(s.size as string | null);
+            const price = fromDb(s.price as string | null);
+            const value = size !== null && price !== null ? mul(size, price) : null;
+            parts.push(`${String(s.outcome ?? '?')} ${decToString(size) ?? '未知'} 份 @ ${decToString(price) ?? '未知'}${value ? ` = $${decToString(value)}` : ''}`);
+        }
+        return `当前组合（按各 token 自身价格）：${parts.join('；')}`;
+    }
+
+    /** /wallet 查询 */
+    walletReport(address: string, opts: { windowsDays?: number[] } = {}): string {
+        const w = address.toLowerCase();
+        const profile = this.profiler.build(w, { windowsDays: opts.windowsDays ?? this.config.rules.baselineWindowsDays });
+        const lines: string[] = [];
+        lines.push(`<b>钱包画像</b> ${this.link(w.slice(0, 10) + '…' + w.slice(-6), `https://polygonscan.com/address/${w}`)}`);
+        lines.push('');
+        lines.push(`<b>覆盖与活跃历史</b>`);
+        lines.push(this.profiler.describeActivityHistory(profile));
+        const c = profile.coverage;
+        if (c.truncated) lines.push(`⚠️ 历史被截断：${escapeHtml(c.truncationReason ?? '未取到来源起点')}`);
+        lines.push('');
+        lines.push(`<b>当前组合</b>（按各 token 自身价格）`);
+        if (!profile.positions.length) lines.push('没有取到持仓快照（未知）');
+        for (const p of profile.positions.slice(0, 8)) {
+            lines.push(`• ${escapeHtml(p.outcome ?? '?')} ${escapeHtml(p.size ?? '未知')} 份 @ ${escapeHtml(p.price ?? '未知')} = $${escapeHtml(p.value ?? '未知')}（${p.completeness}）`);
+        }
+        if (profile.positionValueCovered) lines.push(`已覆盖组合价值：$${escapeHtml(profile.positionValueCovered)}（只覆盖已获取到的持仓，不等于全部财富）`);
+        lines.push('');
+        lines.push(`<b>交易习惯</b>（窗口 ${profile.tradeNotional.windowDays} 天，排除当前待评估行为 ${profile.tradeNotional.excludedEvents} 笔）`);
+        lines.push(`单笔名义金额：样本 ${profile.tradeNotional.samples}，中位 $${escapeHtml(profile.tradeNotional.p50 ?? '未知')}，90 分位 $${escapeHtml(profile.tradeNotional.p90 ?? '未知')}`);
+        lines.push(`活动类型分布：${escapeHtml(Object.entries(profile.activityByType).map(([k, v]) => `${k}×${v}`).join('，') || '无')}`);
+        lines.push('');
+        lines.push(`<b>关系背景</b>`);
+        if (!profile.relations.length) lines.push('没有可核验的控制关系记录（未知，不等于无关联）');
+        for (const r of profile.relations.slice(0, 5)) lines.push(`• ${escapeHtml(r.type)} ← ${escapeHtml(r.to.slice(0, 12))}…（${r.strength}）`);
+        lines.push('');
+        lines.push(`<b>历史表现</b>`);
+        lines.push(escapeHtml(profile.pnl.reason));
+        lines.push('');
+        const gaps = this.repos.openGaps(20).filter((g) => String(g.key) === w);
+        lines.push(`<b>数据缺口</b>：${gaps.length ? escapeHtml(gaps.map((g) => String(g.reason)).join('，')) : '无登记缺口'}`);
+        for (const n of profile.notes) lines.push(`· ${escapeHtml(n)}`);
+        return lines.join('\n');
+    }
+
+    /** /check 市场查询：重点增仓/减仓/退出 + 覆盖说明 */
+    marketReport(conditionId: string, opts: { hours?: number } = {}): string {
+        const hours = opts.hours ?? 24;
+        const since = new Date(Date.now() - hours * 3600_000).toISOString();
+        const market = this.repos.market(conditionId);
+        const tokens = this.repos.db.all<{ token_id: string; outcome: string | null }>('SELECT token_id, outcome FROM outcome_tokens WHERE condition_id=?', conditionId);
+        const events = this.repos.db.all<BehaviorRow & Record<string, unknown>>(
+            `SELECT * FROM behavior_events WHERE condition_id=? AND event_at >= ? ORDER BY event_at DESC LIMIT 40`, conditionId, since,
+        );
+        const watch = this.repos.db.all<{ address: string; source: string; reason: string | null }>(
+            'SELECT address, source, reason FROM watchlist WHERE market_condition_id=? AND withdrawn_at IS NULL LIMIT 60', conditionId,
+        );
+        const obs = this.repos.db.get<{ volume_24h: string | null; liquidity: string | null; observed_at: string }>(
+            'SELECT volume_24h, liquidity, observed_at FROM market_observations WHERE condition_id=? ORDER BY observed_at DESC LIMIT 1', conditionId,
+        );
+        const lines: string[] = [];
+        lines.push(`<b>市场背景</b> ${escapeHtml(market?.question ?? conditionId)}`);
+        if (market?.slug) lines.push(this.link('市场页', `https://polymarket.com/event/${market.slug}`));
+        lines.push(`结果 token：${escapeHtml(tokens.map((t) => `${t.outcome ?? '?'}:${t.token_id.slice(0, 8)}…`).join('，') || '未知')}`);
+        if (obs) lines.push(`最近观察：24h 成交量 $${escapeHtml(obs.volume_24h ?? '未知')}，流动性 $${escapeHtml(obs.liquidity ?? '未知')}（${escapeHtml(toDisplay(obs.observed_at))}）`);
+        lines.push(`观察对象：${watch.length} 个（手动关注 + 显著成交 + 重点持有人）`);
+        lines.push('');
+        lines.push(`<b>最近 ${hours} 小时的行为事件</b>`);
+        if (!events.length) {
+            lines.push('已获取数据中未发现达到记录阈值的事件（这是「未观察到」，不等于「没有发生」；覆盖与缺口见下）');
+        } else {
+            for (const e of events.slice(0, 12)) {
+                const mag = JSON.parse(e.magnitude ?? '{}') as Magnitude;
+                lines.push(`• ${escapeHtml(eventLabel(e.event_type))}｜${escapeHtml(e.wallet.slice(0, 8))}…｜${escapeHtml(String(mag.before ?? '?'))} → ${escapeHtml(String(mag.after ?? '?'))}${mag.pct ? '（' + escapeHtml(mag.pct) + '）' : ''}｜优先级 ${PRIORITY_LABEL[e.priority]}｜质量 ${qualityLabel(e.data_quality)}`);
+            }
+        }
+        lines.push('');
+        lines.push(`<b>覆盖说明</b>`);
+        for (const w of watch.slice(0, 10)) lines.push(`· ${escapeHtml(w.address.slice(0, 10))}… ← ${escapeHtml(w.source)}：${escapeHtml(String(w.reason ?? '').slice(0, 60))}`);
+        const gaps = this.repos.openGaps(40).filter((g) => String(g.key) === conditionId);
+        lines.push(gaps.length
+            ? `缺口：${escapeHtml(gaps.map((g) => String(g.reason)).join('，'))}`
+            : '没有登记缺口（表示已获取区间内未发现，不表示完整覆盖）');
+        return lines.join('\n');
+    }
+
+    /** /status */
+    statusReport(extra: { cycles?: number; lastCycleAt?: string | null; byType?: Record<string, number> } = {}): string {
+        const stats = this.repos.outboxStats();
+        const gaps = this.repos.openGaps(100);
+        const watch = this.repos.watchlist(true);
+        const states = this.repos.db.all<{ key: string; last_ok_at: string | null; consecutive_failures: number; truncated: number; earliest_ts: string | null; reached_start: number }>(
+            'SELECT key, last_ok_at, consecutive_failures, truncated, earliest_ts, reached_start FROM collection_state',
+        );
+        const lines: string[] = [];
+        lines.push(`<b>系统状态</b>`);
+        lines.push(`关注对象：${watch.length}（手动 ${watch.filter((w) => w.source === 'manual').length}）`);
+        lines.push(`采集进度：${states.length} 个游标；其中失败 ${states.filter((s) => s.consecutive_failures > 0).length}，截断 ${states.filter((s) => s.truncated === 1).length}`);
+        const latest = states.map((s) => s.last_ok_at).filter(Boolean).sort().pop();
+        lines.push(`最近一次成功采集：${escapeHtml(toDisplay(latest ?? null))}`);
+        if (extra.lastCycleAt) lines.push(`最近一轮：${escapeHtml(toDisplay(extra.lastCycleAt))}（已跑 ${extra.cycles ?? 0} 轮）`);
+        lines.push(`报警队列：${escapeHtml(JSON.stringify(stats))}（限速 ${this.config.push.maxPerMinute}/分钟；限速溢出会合并成摘要，不丢消息）`);
+        lines.push(`待投递：${this.pendingCountText()}`);
+        lines.push(`未解决缺口：${gaps.length}`);
+        for (const g of gaps.slice(0, 8)) lines.push(`· [${escapeHtml(String(g.scope))}] ${escapeHtml(String(g.reason))}：${escapeHtml(String(g.detail ?? '').slice(0, 80))}`);
+        if (extra.byType) lines.push(`本轮采集：${escapeHtml(JSON.stringify(extra.byType))}`);
+        lines.push(`投递语义：至少一次（发送成功但回写前崩溃会重发一次，不承诺恰好一次）`);
+        return lines.join('\n');
+    }
+
+    private pendingCountText(): string {
+        const r = this.repos.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM alert_outbox WHERE status IN ('pending','retry','sending')`);
+        return String(r?.n ?? 0);
+    }
+
+    /** 市场观察里的「提前进场」表述必须给出相对时刻（方案 §3.3） */
+    static earlyEntryText(activityAt: string, priceChangedAt: string | null): string {
+        if (!priceChangedAt) return `该钱包在 ${toDisplay(activityAt)} 有成交（价格变化时刻未知，无法判断先后）`;
+        const before = Date.parse(activityAt) < Date.parse(priceChangedAt);
+        return before
+            ? `该钱包在价格变化（${toDisplay(priceChangedAt)}）之前 ${durationText(activityAt, priceChangedAt)} 成交`
+            : `该钱包的成交晚于价格变化（观察时刻 ${toDisplay(priceChangedAt)}），不构成「提前进场」证据`;
+    }
+
+    static unixToDisplay(sec: number | null): string { return toDisplay(unixToIso(sec)); }
+    static fmtPct(v: number | null): string { return v === null ? '未知' : `${(v * 100).toFixed(1)}%`; }
+    static fmtDec(v: ReturnType<typeof parseDec>): string { return decToString(v) ?? '未知'; }
+    /** 供测试：金额不做二进制浮点累加 */
+    static sumStrict(values: string[]): string {
+        return decToString(sumDec(values.map((v) => parseDec(v)))) ?? '未知';
+    }
+    static ratioText(from: string | null, to: string | null): string {
+        const f = parseDec(from), t = parseDec(to);
+        if (f === null || t === null || f === 0n) return '未知';
+        return pctString((t - f) * 10n ** 18n / f, 1) ?? '未知';
+    }
+    static toNum(v: string | null): number | null { return decToNumber(parseDec(v)); }
+    static labelUnknown(v: unknown, label = '未知'): string { return v === null || v === undefined || v === '' ? label : String(v); }
+    static sinceText(iso: string): string { return `${durationText(iso, nowIso()) ?? '未知'}前`; }
+}
