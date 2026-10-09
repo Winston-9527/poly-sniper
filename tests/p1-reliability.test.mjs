@@ -57,8 +57,43 @@ test('场景14：达到限速后不丢消息 —— 溢出合并成摘要，重�
     db.close();
 });
 
+test('日上限是硬闸：超过后不再即时推送，并入当日摘要，次日只汇总一条', async () => {
+    const cfg = mkConfig({ push: { maxPerMinute: 100, maxPerDay: 5, maxAttempts: 3, retryBackoffSeconds: [0] } });
+    const db = openDb(':memory:');
+    const repos = new Repos(db);
+    const sent = [];
+    const outbox = new AlertOutbox(repos, cfg, async (_c, body) => { sent.push(body); return { ok: true, messageId: `m${sent.length}` }; });
+    for (let i = 0; i < 12; i++) outbox.enqueue(`alert:d${i}`, { chatId: '999', title: `日上限告警${i}`, body: `b${i}` });
+
+    const t0 = new Date();
+    const r1 = await outbox.flush(t0);
+    assert.equal(r1.sent, 5, '日上限 5 条，只能即时发 5 条');
+    assert.equal(r1.merged, 7);
+    const stats = repos.outboxStats();
+    assert.equal(stats.sent, 5);
+    assert.equal(stats.merged, 7);
+    assert.equal(repos.db.get('SELECT COUNT(*) AS n FROM alert_outbox WHERE dedupe_key=?', `digest-day:${t0.toISOString().slice(0, 10)}`).n, 1, '当日摘要只建一条');
+
+    // 同一天再 flush：一条都不发（日预算已用尽），全部并入摘要
+    const r2 = await outbox.flush(new Date(t0.getTime() + 3600_000));
+    assert.equal(r2.sent, 0);
+    outbox.enqueue('alert:later', { chatId: '999', title: '晚一点的高优先级告警', body: 'x' });
+    const r3 = await outbox.flush(new Date(t0.getTime() + 3700_000));
+    assert.equal(r3.sent, 0, '当天不会再即时推送');
+
+    // 次日：只发一条汇总，且正文里能看到被合并的告警标题
+    const nextDay = new Date(t0.getTime() + 26 * 3600_000);
+    const r4 = await outbox.flush(nextDay);
+    assert.equal(r4.sent, 1, '次日只发一条汇总');
+    const digestMsg = sent[sent.length - 1];
+    assert.match(digestMsg, /被合并的告警（8 条）/);
+    assert.match(digestMsg, /日上限告警5/);
+    assert.match(digestMsg, /晚一点的高优先级告警/);
+    db.close();
+});
+
 test('失败重试 → 超过最大次数转 dead 并保留原因（不静默丢弃）', async () => {
-    const cfg = mkConfig({ push: { maxPerMinute: 10, maxAttempts: 2, retryBackoffSeconds: [0] } });
+    const cfg = mkConfig({ push: { maxPerMinute: 10, maxPerDay: 8, maxAttempts: 2, retryBackoffSeconds: [0] } });
     const db = openDb(':memory:');
     const repos = new Repos(db);
     const outbox = new AlertOutbox(repos, cfg, async () => ({ ok: false, error: '429 Too Many Requests' }));

@@ -74,8 +74,8 @@ test('场景3b：推导归零但快照未确认 → 只报「疑似退出，待�
     const exit = app.repos.eventsForWallet(W1, 10).find((e) => e.event_type === 'position_exited');
     assert.ok(exit);
     assert.equal(exit.data_quality, 'partial', '未确认归零时不能标为已核对');
-    assert.equal(exit.priority, 'medium', '名义金额低于绝对下限时不因「退出」自动升级（避免微小仓位刷屏）');
-    assert.match(exit.priority_reason, /自身持仓变化 -100\.0%/);
+    assert.equal(exit.priority, 'low', '名义金额低于绝对下限 → 记录但不推送（避免微小仓位刷屏）');
+    assert.match(exit.priority_reason, /低于绝对下限/);
     app.close();
 });
 
@@ -226,7 +226,7 @@ test('场景7b：首次在本机出现不获得加分（优先级里没有钱包
     const p2 = computePriority({ ...base, notional: parseDec('1000') });
     assert.equal(p1.priority, 'low');
     assert.equal(p1.priority, p2.priority, '同样的变化必须得到同样的优先级（不存在「新钱包」加成）');
-    assert.match(p1.reason, /未达到绝对下限/);
+    assert.match(p1.reason, /低于绝对下限/);
 });
 
 test('场景8：最早 200 条只涉及一个事件且历史被截断 → 不判定其终身只关注一个事件', async () => {
@@ -285,6 +285,53 @@ test('P1 验收：不依赖完整历史成本也能准确说明上线后的份�
     assert.equal(Number(ep.baseline_complete), 0, '观察起点建立的持仓过程必须标注基线不完整（不补造历史成本）');
     const profile = app.pipeline.profiler.build(W1, { windowsDays: [90] });
     assert.equal(profile.pnl.available, false, '成本不完整时不输出收益率');
+    app.close();
+});
+
+test('回归：未登记市场的活动也能入账（不会因外键建不起持仓过程而中断整轮）', async () => {
+    const app = mkApp();
+    // 注意：故意不调用 seedMarket，模拟「钱包在其它市场成交、该市场尚未登记」
+    seedWallet(app.repos, W1, '2026-09-01T00:00:00.000Z');
+    seedActivity(app.repos, {
+        wallet: W1, tokenId: TOKEN, conditionId: '0xfeed00000000000000000000000000000000000000000000000000000000000000',
+        side: 'BUY', size: '1234', price: '0.25', usdcSize: '308.5', eventAt: T1, txHash: '0xunknown',
+    });
+    const res = await app.pipeline.processWallet(W1, '', { skipNetwork: true });
+    assert.equal(res.eventsCreated, 1, '必须产生一条行为事件');
+    const entries = app.repos.ledgerForWallet(W1);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].kind, 'trade_buy');
+    assert.equal(entries[0].delta_size, '1234');
+    assert.ok(Number(entries[0].episode_id) > 0, '账本条目必须挂在真实持仓过程上');
+    app.close();
+});
+
+test('回归：上一轮持仓过程已关闭后又有新活动 → 另开新一轮，不递归、不丢账', async () => {
+    const app = setup();
+    const T3 = '2026-10-04T00:00:00.000Z';
+    const T4 = '2026-10-05T00:00:00.000Z';
+    // 第一轮：持有 10000，卖光 → 过程关闭
+    seedPosition(app.repos, { wallet: W1, size: '10000', price: '0.5', snapshotAt: T0 });
+    await app.pipeline.processWallet(W1, CID, { skipNetwork: true });
+    seedActivity(app.repos, { wallet: W1, tokenId: TOKEN, conditionId: CID, side: 'SELL', size: '10000', price: '0.5', usdcSize: '5000', eventAt: T1, txHash: '0xs1' });
+    seedPosition(app.repos, { wallet: W1, size: '0', price: '0', snapshotAt: T1 });
+    await app.pipeline.processWallet(W1, CID, { skipNetwork: true });
+    const closed = app.repos.db.get("SELECT * FROM position_episodes WHERE wallet=? AND token_id=? ORDER BY opened_at", W1, TOKEN);
+    assert.equal(closed.status, 'closed');
+
+    // 第二轮：快照显示又有 5000 份（重新建仓），随后又买入 1000 份
+    seedPosition(app.repos, { wallet: W1, size: '5000', price: '0.6', snapshotAt: T3 });
+    await app.pipeline.processWallet(W1, CID, { skipNetwork: true });
+    seedActivity(app.repos, { wallet: W1, tokenId: TOKEN, conditionId: CID, side: 'BUY', size: '1000', price: '0.6', usdcSize: '600', eventAt: T4, txHash: '0xb2' });
+    const res = await app.pipeline.processWallet(W1, CID, { skipNetwork: true });   // 曾经在这里无限递归
+    assert.ok(res, '不能抛栈溢出');
+    const eps = app.repos.db.all("SELECT * FROM position_episodes WHERE wallet=? AND token_id=? ORDER BY opened_at", W1, TOKEN);
+    assert.equal(eps.length, 2, '应另开一条新的持仓过程');
+    assert.equal(String(eps[1].status), 'open');
+    assert.equal(String(eps[1].last_size), '6000', '新过程的份数 = 快照 5000 + 买入 1000');
+    const entries = app.repos.ledgerForWallet(W1);
+    assert.ok(entries.some((e) => e.kind === 'trade_buy' && e.delta_size === '1000'), '买入必须入账');
+    assert.ok(entries.every((e) => Number(e.episode_id) > 0), '账本条目必须挂在真实的持仓过程上');
     app.close();
 });
 

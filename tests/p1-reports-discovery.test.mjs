@@ -156,7 +156,7 @@ test('「提前进场」必须说明相对哪个时刻', () => {
 });
 
 test('影子模式：不向 Telegram 发送真实消息，但状态机照常走完', async () => {
-    const app = createApp({ dbPath: tempDbPath(), config: { shadowMode: true } });
+    const app = createApp({ dbPath: tempDbPath(), config: { shadowMode: true, telegram: { token: '', chatIds: ['999'], enabled: false } } });
     assert.equal(app.config.shadowMode, true);
     app.repos.enqueueAlert('alert:shadow', JSON.stringify({ chatId: '999', title: 't', body: 'b' }));
     const r = await app.outbox.flush(new Date());

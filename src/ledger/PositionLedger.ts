@@ -9,6 +9,7 @@
  *   - 估值按「该 token 自己的价格」计算，绝不拿另一边的价格给这一边估值（方案 §3.2、§12）。
  */
 import { Repos } from '../db/repos.js';
+import type { Row } from '../db/Database.js';
 import { add, cmp, decToString, div, mul, neg, parseDec, pctChange, sub, Dec, ZERO } from '../util/decimal.js';
 import { nowIso } from '../util/time.js';
 
@@ -86,6 +87,9 @@ export class PositionLedger {
             initialSize: decToString(w.size) ?? '0',
             baselineComplete: false,
         });
+        if (id === null) {
+            return { episodeId: null, issue: { scope: 'wallet', key: `${w.wallet}:${w.tokenId}`, reason: 'query_failed', detail: `无法建立持仓过程（conditionId=${w.conditionId} 是否已登记？）` } };
+        }
         return { episodeId: id };
     }
 
@@ -107,7 +111,7 @@ export class PositionLedger {
 
         const episode = this.repos.openEpisodeFor(a.wallet, a.token_id);
         if (!episode) {
-            // 没有观察起点：先建立（不补造历史），再做账
+            // 没有未关闭的观察起点：先建立（不补造历史），再做账
             if (size === null) {
                 return { change: null, issue: { scope: 'wallet', key: `${a.wallet}:${a.token_id}`, reason: 'incomplete_record', detail: `活动 ${base} 缺少份数，无法建立持仓过程` } };
             }
@@ -118,11 +122,29 @@ export class PositionLedger {
             const isBuy = base === 'TRADE' && a.side === 'BUY';
             // 从观察起点开始：第一笔若为买入，起点记为 0 之后再加；若为卖出，起点未知（记为 0 并标注缺口）
             const opened = this.openFromSnapshot({ wallet: a.wallet, tokenId: a.token_id, conditionId, outcome: a.outcome, size: ZERO, snapshotAt: a.event_at, reason: 'first_observed_change' });
-            if (opened.issue) return { change: null, issue: opened.issue };
-            const issue: LedgerIssue | undefined = isBuy ? undefined : { scope: 'wallet', key: `${a.wallet}:${a.token_id}`, reason: 'incomplete_record', detail: '观察起点之前已有持仓：卖出发生在本机首次见到该持仓之前，份数变化只能作为下界' };
-            const applied = this.applyActivity(a);
-            // 起点为推断的 0：baseline_complete 必须保持 0
-            return issue ? { change: applied.change, issue } : applied;
+            if (!opened.episodeId) {
+                return { change: null, issue: opened.issue ?? { scope: 'wallet', key: `${a.wallet}:${a.token_id}`, reason: 'unexplained_change', detail: '无法为该 token 建立持仓过程，本次变化未入账' } };
+            }
+            const ep = this.repos.episodeById(opened.episodeId);
+            if (!ep) {
+                return { change: null, issue: { scope: 'wallet', key: `${a.wallet}:${a.token_id}`, reason: 'unexplained_change', detail: '持仓过程建立后读不回来，本次变化未入账' } };
+            }
+            const applied = this.applyToEpisode(ep, a, size, usdc, base);
+            // 起点为推断的 0：baseline_complete 必须保持 0；卖出（起点之前已有持仓）额外标注下界
+            const preIssue: LedgerIssue | undefined = isBuy ? undefined : { scope: 'wallet', key: `${a.wallet}:${a.token_id}`, reason: 'incomplete_record', detail: '观察起点之前已有持仓：卖出发生在本机首次见到该持仓之前，份数变化只能作为下界' };
+            return { change: applied.change, issue: preIssue ?? applied.issue };
+        }
+        return this.applyToEpisode(episode, a, size, usdc, base);
+    }
+
+    /**
+     * 把一条活动应用到「已确定可用」的持仓过程上。
+     * 注意：这里不允许再回头去找/建过程，避免出现自我递归（曾在服务上导致栈溢出）。
+     */
+    private applyToEpisode(episode: Row, a: ActivityRow, size: Dec | null, usdc: Dec | null, base: string): { change: AppliedChange | null; issue?: LedgerIssue } {
+        const tokenId = a.token_id;
+        if (!tokenId) {
+            return { change: null, issue: { scope: 'wallet', key: `${a.wallet}:${a.activity_key}`, reason: 'unsupported_activity', detail: `活动 ${base} 没有 token 标识，无法归因到持仓` } };
         }
         const episodeId = Number(episode.id);
         const before = parseDec(String(episode.last_size));
@@ -131,7 +153,7 @@ export class PositionLedger {
         // ---- 现金类（无份数变化）----
         if (CASH_ONLY.has(base)) {
             this.repos.appendLedgerEntry({
-                episodeId, wallet: a.wallet, tokenId: a.token_id, kind: 'reward', deltaSize: '0', cashDelta: decToString(usdc),
+                episodeId, wallet: a.wallet, tokenId, kind: 'reward', deltaSize: '0', cashDelta: decToString(usdc),
                 sourceRecordId: a.source_record_id, sourceType: 'verified', eventAt: a.event_at, observedAt: nowIso(),
                 note: `${base}`, dedupeKey: `act:${a.id}`,
             });
@@ -142,7 +164,7 @@ export class PositionLedger {
         const unquantified = RECOGNIZED_UNQUANTIFIED[base];
         if (unquantified) {
             this.repos.appendLedgerEntry({
-                episodeId, wallet: a.wallet, tokenId: a.token_id, kind: unquantified, deltaSize: '0',
+                episodeId, wallet: a.wallet, tokenId, kind: unquantified, deltaSize: '0',
                 cashDelta: decToString(usdc), sourceRecordId: a.source_record_id, sourceType: 'unexplained',
                 eventAt: a.event_at, observedAt: nowIso(),
                 note: `${base}：份数变化待与快照核对`, dedupeKey: `act:${a.id}`,
@@ -166,7 +188,7 @@ export class PositionLedger {
             const oversold = before !== null && after < 0n;
             const cash = usdc === null ? null : (a.side === 'BUY' ? neg(usdc)! : usdc);
             this.repos.appendLedgerEntry({
-                episodeId, wallet: a.wallet, tokenId: a.token_id, kind: a.side === 'BUY' ? 'trade_buy' : 'trade_sell',
+                episodeId, wallet: a.wallet, tokenId, kind: a.side === 'BUY' ? 'trade_buy' : 'trade_sell',
                 deltaSize: decToString(delta)!, cashDelta: decToString(cash), sourceRecordId: a.source_record_id,
                 sourceType: 'verified', eventAt: a.event_at, observedAt: nowIso(),
                 note: `${outcome || '?'} ${a.side} @ ${a.price ?? '?'}`, dedupeKey: `act:${a.id}`,
@@ -188,7 +210,7 @@ export class PositionLedger {
             const delta = before === null ? null : neg(before)!;
             const after = before === null ? null : ZERO;
             this.repos.appendLedgerEntry({
-                episodeId, wallet: a.wallet, tokenId: a.token_id, kind: 'redeem', deltaSize: decToString(delta) ?? '0',
+                episodeId, wallet: a.wallet, tokenId, kind: 'redeem', deltaSize: decToString(delta) ?? '0',
                 cashDelta: decToString(usdc), sourceRecordId: a.source_record_id, sourceType: 'derived',
                 eventAt: a.event_at, observedAt: nowIso(), note: '赎回：按推导持仓归零', dedupeKey: `act:${a.id}`,
             });
@@ -201,7 +223,7 @@ export class PositionLedger {
 
         // ---- 其它未知类型：保留证据，不伪造买卖 ----
         this.repos.appendLedgerEntry({
-            episodeId, wallet: a.wallet, tokenId: a.token_id, kind: 'unexplained', deltaSize: '0',
+            episodeId, wallet: a.wallet, tokenId, kind: 'unexplained', deltaSize: '0',
             cashDelta: decToString(usdc), sourceRecordId: a.source_record_id, sourceType: 'unexplained',
             eventAt: a.event_at, observedAt: nowIso(), note: `未识别类型 ${a.type}`, dedupeKey: `act:${a.id}`,
         });

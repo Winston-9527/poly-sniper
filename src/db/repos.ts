@@ -297,17 +297,34 @@ export class Repos {
     }
 
     // ---------- 持仓过程与账本 ----------
-    openEpisode(e: EpisodeInput): number {
+    /**
+     * 建立一条**可用**的持仓过程：
+     *  - 已有未关闭的过程 → 直接复用；
+     *  - 否则插入一条新的；若该 (wallet, token, opened_at) 已被关闭过（例如上一轮已退出/赎回），
+     *    把起点顺延 1 秒另开一条，视为「新一轮持仓过程」。绝不返回一条不可用的过程（历史上这会导致递归）。
+     */
+    openEpisode(e: EpisodeInput): number | null {
         const now = nowIso();
-        this.db.run(
-            `INSERT OR IGNORE INTO position_episodes(wallet, condition_id, token_id, outcome, opened_at, opened_reason, initial_size, baseline_complete, last_size, status, updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?, 'open', ?)`,
-            e.wallet.toLowerCase(), e.conditionId, e.tokenId, e.outcome ?? null, e.openedAt, e.openedReason,
-            e.initialSize, e.baselineComplete ? 1 : 0, e.initialSize, now,
-        );
-        const row = this.db.get<{ id: number }>('SELECT id FROM position_episodes WHERE wallet=? AND token_id=? AND opened_at=?', e.wallet.toLowerCase(), e.tokenId, e.openedAt);
-        if (!row) throw new Error('position_episodes 插入失败');
-        return row.id;
+        const existingOpen = this.openEpisodeFor(e.wallet, e.tokenId);
+        if (existingOpen) return Number(existingOpen.id);
+        let openedAt = e.openedAt;
+        for (let i = 0; i < 6; i++) {
+            this.db.run(
+                `INSERT OR IGNORE INTO position_episodes(wallet, condition_id, token_id, outcome, opened_at, opened_reason, initial_size, baseline_complete, last_size, status, updated_at)
+                 VALUES (?,?,?,?,?,?,?,?,?, 'open', ?)`,
+                e.wallet.toLowerCase(), e.conditionId, e.tokenId, e.outcome ?? null, openedAt, e.openedReason,
+                e.initialSize, e.baselineComplete ? 1 : 0, e.initialSize, now,
+            );
+            const row = this.db.get<{ id: number; status: string }>('SELECT id, status FROM position_episodes WHERE wallet=? AND token_id=? AND opened_at=?', e.wallet.toLowerCase(), e.tokenId, openedAt);
+            if (row && String(row.status) === 'open') return Number(row.id);
+            openedAt = new Date(Date.parse(openedAt) + 1000).toISOString();
+        }
+        // 不抛异常：一条坏记录不应该让整轮采集失败，交给调用方记缺口
+        return null;
+    }
+
+    episodeByKey(wallet: string, tokenId: string, openedAt: string): { id: number; status: string } | undefined {
+        return this.db.get('SELECT id, status FROM position_episodes WHERE wallet=? AND token_id=? AND opened_at=?', wallet.toLowerCase(), tokenId, openedAt);
     }
 
     openEpisodeFor(wallet: string, tokenId: string): Row | undefined {

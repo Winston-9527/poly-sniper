@@ -52,30 +52,39 @@ export class AlertOutbox {
         return n;
     }
 
-    /** 投递到期条目，受每分钟限速约束 */
+    /** 投递到期条目，受「每分钟限速」与「每日上限」双重约束（防刷屏） */
     async flush(now = new Date()): Promise<FlushReport> {
         const report: FlushReport = { sent: 0, failed: 0, retried: 0, dead: 0, merged: 0, deferredByRateLimit: 0, details: [] };
         const nowIsoStr = now.toISOString();
         const since = new Date(now.getTime() - 60_000).toISOString();
         let budget = Math.max(0, this.config.push.maxPerMinute - this.repos.sentSince(since));
+        // 日上限：超过后不再即时推送，全部并入「当日摘要」，次日只发一条汇总
+        const dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
+        let dayBudget = Math.max(0, this.config.push.maxPerDay - this.repos.sentSince(dayStart));
 
         const due = this.repos.dueAlerts(nowIsoStr, this.config.push.maxPerMinute * 10);
         for (const row of due) {
             const id = Number(row.id);
-            if (budget <= 0) {
-                // 限速：合并进摘要窗口，不丢（方案 §7.3）
-                const digestId = this.digestFor(now);
+            if (budget <= 0 || dayBudget <= 0) {
+                const overDay = dayBudget <= 0;
+                const digestId = overDay ? this.dayDigestFor(now) : this.digestFor(now);
                 this.repos.mergeAlert(id, digestId, nowIsoStr);
                 report.merged++;
                 report.deferredByRateLimit++;
+                if (overDay) report.details.push(`已达日上限 ${this.config.push.maxPerDay} 条，合并进当日摘要（次日发送）`);
                 continue;
             }
             const payload = JSON.parse(String(row.payload)) as AlertPayload;
+            // 摘要类条目在发送前用当前被合并的标题刷新正文
+            if (String(row.dedupe_key ?? '').startsWith('digest')) {
+                payload.body = this.renderDigest(id);
+                payload.title = this.digestTitle(id) ?? payload.title;
+            }
             if (!this.repos.claimAlert(id, nowIsoStr)) continue;
             const res = await this.sender(payload.chatId, payload.body);
             if (res.ok) {
                 this.repos.markAlertSent(id, res.messageId ?? null, nowIsoStr);
-                budget--;
+                budget--; dayBudget--;
                 report.sent++;
             } else {
                 const attempts = Number(row.attempts ?? 0);
@@ -106,16 +115,55 @@ export class AlertOutbox {
         return this.repos.enqueueAlert(key, JSON.stringify(payload)).id;
     }
 
-    /** 把已合并条目的标题写进摘要正文（发送前调用） */
-    renderDigest(digestId: number): string {
-        const rows = this.repos.db.all<{ payload: string }>('SELECT payload FROM alert_outbox WHERE merged_into=?', digestId);
-        const titles = rows.map((r) => {
-            try { return (JSON.parse(r.payload) as AlertPayload).title; } catch { return '（无法解析）'; }
-        });
+    /**
+     * 当日摘要（每天一个）：日上限用尽后所有告警并入这里，**次日**才投递一条汇总。
+     * 这是防刷屏的硬闸：宁可晚一天给汇总，也不在半天里把消息打满。
+     */
+    private dayDigestFor(now: Date): number {
+        const day = now.toISOString().slice(0, 10);
+        const key = `digest-day:${day}`;
+        const existing = this.repos.db.get<{ id: number }>('SELECT id FROM alert_outbox WHERE dedupe_key=?', key);
+        if (existing) return Number(existing.id);
         const payload: AlertPayload = {
             chatId: this.config.telegram.chatIds[0] ?? '',
-            title: `合并摘要：${titles.length} 条告警`,
-            body: ['被限速合并的告警：', ...titles.map((t) => `• ${t}`)].join('\n'),
+            title: `当日汇总（${day}）：已达日上限`,
+            body: '当日推送已达上限，其余告警并入本条汇总。',
+        };
+        const id = this.repos.enqueueAlert(key, JSON.stringify(payload)).id;
+        // 次日 00:05（UTC）之后才到期
+        const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 5));
+        this.repos.db.run('UPDATE alert_outbox SET next_attempt_at=? WHERE id=?', next.toISOString(), id);
+        return id;
+    }
+
+    private digestTitle(id: number): string | null {
+        const row = this.repos.db.get<{ dedupe_key: string }>('SELECT dedupe_key FROM alert_outbox WHERE id=?', id);
+        const key = String(row?.dedupe_key ?? '');
+        const n = this.mergedChildren(id).length;
+        if (key.startsWith('digest-day')) return `当日汇总（${key.slice(11)}）：${n} 条告警被合并`;
+        return n ? `合并摘要：${n} 条告警` : null;
+    }
+
+    private mergedChildren(digestId: number): { title: string; body: string }[] {
+        const rows = this.repos.db.all<{ payload: string }>('SELECT payload FROM alert_outbox WHERE merged_into=? ORDER BY created_at', digestId);
+        return rows.map((r) => {
+            try {
+                const p = JSON.parse(r.payload) as AlertPayload;
+                return { title: p.title ?? '（无标题）', body: p.body ?? '' };
+            } catch { return { title: '（无法解析）', body: '' }; }
+        });
+    }
+
+    /** 把已合并条目的标题写进摘要正文（发送前调用） */
+    renderDigest(digestId: number): string {
+        const children = this.mergedChildren(digestId);
+        const head = `被合并的告警（${children.length} 条）：`;
+        const shown = children.slice(0, 30).map((c) => `• ${c.title}`);
+        if (children.length > 30) shown.push(`…另有 ${children.length - 30} 条`);
+        const payload: AlertPayload = {
+            chatId: this.config.telegram.chatIds[0] ?? '',
+            title: this.digestTitle(digestId) ?? '合并摘要',
+            body: [head, ...shown].join('\n'),
         };
         this.repos.updateAlertPayload(digestId, JSON.stringify(payload));
         return payload.body;

@@ -19,6 +19,10 @@ export interface ProcessResult {
     ledger: { applied: number; skippedHistory: number; issues: LedgerIssue[] };
     eventsCreated: number;
     eventIds: number[];
+    /** 本轮实际入队的报警数 */
+    alertsEnqueued: number;
+    /** 记录但未推送的事件数（每轮入队上限 / 低优先级） */
+    alertsSuppressed: number;
     gaps: number;
 }
 
@@ -30,6 +34,8 @@ export interface CycleReport {
     processed: number;
     events: number;
     queued: number;
+    /** 记录但未推送的事件数 */
+    suppressed: number;
     flush: { sent: number; failed: number; retried: number; dead: number; merged: number } | null;
     warnings: string[];
 }
@@ -41,6 +47,8 @@ export class LedgerPipeline {
     readonly reports: Reports;
     private cycles = 0;
     private lastCycleAt: string | null = null;
+    /** 本轮已入队的报警数（每轮上限，防一轮打满消息） */
+    private cycleEnqueued = 0;
 
     constructor(private deps: {
         repos: Repos; collector: Collector; config: Config; outbox: AlertOutbox;
@@ -123,6 +131,12 @@ export class LedgerPipeline {
         const changes: { change: ChangeForBehavior; price: Dec | null; sourceNote: string }[] = [];
         for (const row of this.repos.unappliedActivities(w)) {
             const a = row as unknown as ActivityRow;
+            // 活动所属的市场/token 先在库里登记：position_episodes 对 markets 有外键，
+            // 未登记的市场会让持仓过程建不起来（曾经导致整轮采集失败）。
+            if (a.condition_id) {
+                this.repos.upsertMarket({ conditionId: a.condition_id });
+                if (a.token_id) this.repos.upsertOutcomeToken({ tokenId: a.token_id, conditionId: a.condition_id, outcome: a.outcome ?? null, outcomeIndex: null });
+            }
             const epBefore = a.token_id ? this.repos.openEpisodeFor(w, a.token_id) : undefined;
             const laterThanStart = a.event_at >= (epBefore ? String(epBefore.opened_at) : observationStart);
             if (!laterThanStart) {
@@ -186,7 +200,7 @@ export class LedgerPipeline {
             `SELECT event_at FROM wallet_activities WHERE wallet=? AND event_at < ? ORDER BY event_at DESC LIMIT 1`,
             w, changes.length ? changes[0].change.eventAt : nowIso(),
         );
-        let eventsCreated = 0; const eventIds: number[] = []; let queued = 0;
+        let eventsCreated = 0; const eventIds: number[] = []; let queued = 0; let alertsSuppressed = 0;
         for (const c of changes.slice().sort((x, y) => Date.parse(x.change.eventAt) - Date.parse(y.change.eventAt))) {
             const notional = c.change.deltaSize !== null && c.price !== null ? mul(c.change.deltaSize < 0n ? -c.change.deltaSize : c.change.deltaSize, c.price) : null;
             const relative = notional !== null && typical !== null && typical !== 0n ? div(notional, typical) : null;
@@ -235,13 +249,20 @@ export class LedgerPipeline {
             // 入队（影子模式下由 no-op 发送器接管，状态机照常走）
             const row = this.repos.db.get<BehaviorRow>('SELECT * FROM behavior_events WHERE dedupe_key=?', out.dedupeKey);
             if (row && out.priority !== 'low') {
-                const rep = this.reports.behaviorReport(row, { shadow: this.deps.config.shadowMode });
-                const enq = this.deps.outbox.enqueueReport(out.dedupeKey, {
-                    chatId: this.deps.config.telegram.chatIds[0] ?? '',
-                    title: rep.title, body: rep.body, eventId: row.id, wallet: w,
-                    conditionId: out.conditionId, priority: out.priority, dataQuality: out.dataQuality,
-                });
-                if (enq.inserted) queued++;
+                if (this.cycleEnqueued >= this.deps.config.push.maxPerCycleAlerts) {
+                    // 每轮入队上限：事件照常记录，只是不推送，避免一轮就把消息打满
+                    alertsSuppressed++;
+                } else {
+                    const rep = this.reports.behaviorReport(row, { shadow: this.deps.config.shadowMode });
+                    const enq = this.deps.outbox.enqueueReport(out.dedupeKey, {
+                        chatId: this.deps.config.telegram.chatIds[0] ?? '',
+                        title: rep.title, body: rep.body, eventId: row.id, wallet: w,
+                        conditionId: out.conditionId, priority: out.priority, dataQuality: out.dataQuality,
+                    });
+                    if (enq.inserted) { queued++; this.cycleEnqueued++; }
+                }
+            } else if (row && out.priority === 'low') {
+                alertsSuppressed++;
             }
         }
 
@@ -252,7 +273,7 @@ export class LedgerPipeline {
             wallet: w,
             collected: { activityInserted, pages, stopped, warnings, error },
             ledger: { applied, skippedHistory, issues },
-            eventsCreated, eventIds, gaps: this.repos.openGaps(200).filter((g) => String(g.key) === w).length,
+            eventsCreated, eventIds, alertsEnqueued: queued, alertsSuppressed, gaps: this.repos.openGaps(200).filter((g) => String(g.key) === w).length,
         };
     }
 
@@ -283,14 +304,16 @@ export class LedgerPipeline {
             if (d.skippedOverBudget > 0) warnings.push(`市场 ${m} 有 ${d.skippedOverBudget} 个候选因预算未纳入（已记缺口）`);
         }
 
+        this.cycleEnqueued = 0;
         const due = this.repos.dueWatch(nowIso(), cfg.budgets.walletsPerCycle);
-        let processed = 0, events = 0, queued = 0;
+        let processed = 0, events = 0, queued = 0, suppressed = 0;
         for (const row of due) {
             const address = String(row.address), market = String(row.market_condition_id ?? '');
             const res = await this.processWallet(address, market);
             processed++;
             events += res.eventsCreated;
-            queued += res.eventIds.length;
+            queued += res.alertsEnqueued;
+            suppressed += res.alertsSuppressed;
             warnings.push(...res.collected.warnings.map((x) => `${address.slice(0, 8)}…: ${x}`));
             const tier = Number(row.priority_tier);
             this.repos.setWatchState(address, market, {
@@ -303,7 +326,7 @@ export class LedgerPipeline {
         const flush = opts.flush === false ? null : await this.deps.outbox.flush();
         this.cycles++;
         this.lastCycleAt = nowIso();
-        return { startedAt: started, finishedAt: nowIso(), markets, discovered, processed, events, queued, flush, warnings };
+        return { startedAt: started, finishedAt: nowIso(), markets, discovered, processed, events, queued, suppressed, flush, warnings };
     }
 
     stats(): { cycles: number; lastCycleAt: string | null } { return { cycles: this.cycles, lastCycleAt: this.lastCycleAt }; }

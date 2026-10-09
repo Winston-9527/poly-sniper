@@ -50,7 +50,7 @@ async function main() {
         for (const d of rep.discovered) {
             console.log(`发现：${d.market.slice(0, 14)}… 新增关注 ${d.added}（${JSON.stringify(d.byEntry)}），因预算跳过 ${d.skippedOverBudget}`);
         }
-        console.log(`处理对象：${rep.processed}；新增行为事件：${rep.events}；入队：${rep.queued}`);
+        console.log(`处理对象：${rep.processed}；新增行为事件：${rep.events}；入队：${rep.queued}；记录未推送：${rep.suppressed}`);
         if (rep.flush) console.log(`投递：${JSON.stringify(rep.flush)}`);
         for (const w of rep.warnings.slice(0, 10)) console.log(`警告：${w}`);
 

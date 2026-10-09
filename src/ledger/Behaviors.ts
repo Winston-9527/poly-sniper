@@ -114,10 +114,11 @@ export interface PriorityInput {
 }
 
 /**
- * 可解释优先级规则（版本见 config.RULES_VERSION）：
- *   high   ：名义金额 ≥ 绝对下限 且（自身持仓变化 ≥ 50% 或 ≥ 3 倍历史典型规模）
- *   medium ：名义金额 ≥ 绝对下限 或 自身持仓变化 ≥ reducePctThreshold
- *   low    ：其余
+ * 可解释优先级规则（版本见 config.RULES_VERSION）。**先过绝对规模下限，再看相对变化**：
+ *   高：名义金额 ≥ 绝对下限 且（自身持仓变化 ≥ 50% 或 ≥ 3 倍历史典型规模；
+ *       新出现持仓 ≥ 3 倍下限；本地址退出且 ≥ 下限）
+ *   中：名义金额 ≥ 绝对下限 且（自身持仓变化 ≥ reducePctThreshold 或 ≥ 2 倍历史典型规模 或 ≥ 2 倍下限）
+ *   低：其余（记录但不推送 —— 方案 §7.3：没达到优先级的原始事件仍然存储）
  * 数据质量不参与优先级打分，只在报告中单独展示；钱包年龄不参与打分。
  */
 export function computePriority(input: PriorityInput): { priority: Priority; reason: string } {
@@ -127,31 +128,37 @@ export function computePriority(input: PriorityInput): { priority: Priority; rea
     const pctNum = input.positionChangeRatio === null ? null : Math.abs(decToNumber(input.positionChangeRatio)!);
     const parts: string[] = [];
 
-    const bigEnough = notionalNum !== null && notionalNum >= floor;
+    if (notionalNum === null) {
+        return { priority: 'low', reason: '名义金额未知（缺少价格或份数），不凭猜测升级优先级' };
+    }
+    const bigEnough = notionalNum >= floor;
     const bigMove = pctNum !== null && pctNum >= 0.5;
     const bigRelative = relNum !== null && relNum >= input.rules.relativeSizeMultiplier;
+    const midMove = pctNum !== null && pctNum >= input.rules.reducePctThreshold;
+    const midRelative = relNum !== null && relNum >= 2;
+    const openBig = input.eventType === 'position_opened' && notionalNum >= floor * input.rules.openHighMultiplier;
 
+    if (openBig) {
+        return { priority: 'high', reason: `新出现持仓，名义金额 ≥ ${input.rules.openHighMultiplier} 倍绝对下限（${floor}）；按绝对规模判定，不依赖账户年龄或同源关系` };
+    }
     if (input.eventType === 'position_exited' && bigEnough) {
         return { priority: 'high', reason: `本地址退出，名义金额 ≥ 绝对下限（${floor}）` };
-    }
-    if (input.eventType === 'position_opened' && notionalNum !== null && notionalNum >= floor * input.rules.openHighMultiplier) {
-        return { priority: 'high', reason: `新出现持仓，名义金额 ≥ ${input.rules.openHighMultiplier} 倍绝对下限（${floor}）；按绝对规模判定，不依赖账户年龄或同源关系` };
     }
     if (bigEnough && (bigMove || bigRelative)) {
         if (bigMove) parts.push(`自身持仓变化 ${pctString(input.positionChangeRatio)}（≥50%）`);
         if (bigRelative) parts.push(`约 ${relNum!.toFixed(1)} 倍历史典型规模（≥${input.rules.relativeSizeMultiplier} 倍）`);
         parts.push(`名义金额 ≥ 绝对下限（${floor}）`);
-        const base: Priority = input.firstTimeLongTermChange ? 'high' : 'high';
-        return { priority: base, reason: parts.join('；') };
+        return { priority: 'high', reason: parts.join('；') };
     }
-    if (bigEnough || (pctNum !== null && pctNum >= input.rules.reducePctThreshold)) {
-        if (bigEnough) parts.push(`名义金额 ≥ 绝对下限（${floor}）`);
-        if (pctNum !== null && pctNum >= input.rules.reducePctThreshold) parts.push(`自身持仓变化 ${pctString(input.positionChangeRatio)}（≥${(input.rules.reducePctThreshold * 100).toFixed(0)}%）`);
+    if (bigEnough && (midMove || midRelative || notionalNum >= floor * 2)) {
+        if (midMove) parts.push(`自身持仓变化 ${pctString(input.positionChangeRatio)}（≥${(input.rules.reducePctThreshold * 100).toFixed(0)}%）`);
+        else if (midRelative) parts.push(`约 ${relNum!.toFixed(1)} 倍历史典型规模`);
+        else parts.push(`名义金额 ≥ 2 倍绝对下限（${floor}）`);
         return { priority: 'medium', reason: parts.join('；') };
     }
-    if (notionalNum === null) parts.push('名义金额未知');
+    if (!bigEnough) parts.push(`名义金额 $${notionalNum.toFixed(0)} 低于绝对下限（${floor}）`);
+    else parts.push('相对变化未达到阈值');
     if (relNum === null && pctNum === null) parts.push('缺少可比较的历史基线');
-    parts.push('未达到绝对下限，也未达到相对变化阈值');
     return { priority: 'low', reason: parts.join('；') };
 }
 
