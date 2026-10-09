@@ -85,6 +85,25 @@ export class LedgerBot {
         return this.sender(target, html);
     }
 
+    /**
+     * 为一次性发送创建 Telegram 客户端（**不开轮询**）。
+     * 供 test-push 这类工具使用：不与正在运行的服务抢 getUpdates（避免 409 Conflict），
+     * 也不受 TELEGRAM_ENABLED 影响（该开关只管常驻轮询）。
+     */
+    ensureSender(): boolean {
+        if (this.bot) return true;
+        const { token } = this.deps.config.telegram;
+        if (!token) return false;
+        const options: TelegramBot.ConstructorOptions = { polling: false };
+        if (this.deps.config.proxyUrl) {
+            // @ts-expect-error node-telegram-bot-api 类型未包含 request 选项
+            options.request = { agent: new HttpsProxyAgent(this.deps.config.proxyUrl) };
+        }
+        this.bot = new TelegramBot(token, options);
+        this.log('[bot] 已创建一次性发送客户端（不轮询，不影响正在运行的服务）');
+        return true;
+    }
+
     start(): void {
         const { token, enabled } = this.deps.config.telegram;
         if (!token || !enabled) {
