@@ -9,6 +9,8 @@ coverage
 # Production
 dist
 dist-real
+# 误提交的编译产物：tsc 只应输出到 dist/，src 下不应有 .js
+src/**/*.js
 
 # Misc
 .DS_Store
