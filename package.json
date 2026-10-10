@@ -1,10 +1,13 @@
 {
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-assets.mjs",
+    "test": "tsc && node scripts/copy-assets.mjs && node --test tests/",
     "start": "node dist/index.js",
+    "shadow": "npm run build && node dist/tools/shadow-run.js",
+    "test-push": "npm run build && node dist/tools/test-push.js",
+    "probe": "node tools/probe-contracts.mjs",
     "dev": "node --loader ts-node/esm src/index.ts",
-    "test:manual": "node test-manual-command.js",
     "monitor-btc": "node --loader ts-node/esm src/btc-monitor.ts"
   },
   "dependencies": {
@@ -21,5 +24,8 @@
     "@types/node-telegram-bot-api": "^0.64.13",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.5"
   }
 }

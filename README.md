@@ -51,17 +51,19 @@ npm install
 # Telegram Bot 配置 (用于接收报警推送)
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id
+# 新链路默认影子运行（只记录不发送）；要真正推送才设为 1
+TELEGRAM_ENABLED=0
 
 # 区块链与网络配置
-# Polygon RPC 节点地址 (用于链上数据分析)
-POLYGON_RPC_URL=https://polygon-rpc.com
-# 或者使用通用的 RPC_URL
-RPC_URL=https://polygon-rpc.com
+# polygon-rpc.com 已停用（tenant disabled），用公共端点
+POLYGON_RPC_URL=https://polygon-bor-rpc.publicnode.com
 
 # (可选) 代理配置 - 如果你的网络环境需要代理才能访问 Polymarket 或 Telegram API
-HTTPS_PROXY=http://127.0.0.1:7890
-HTTP_PROXY=http://127.0.0.1:7890
+HTTPS_PROXY=http://127.0.0.1:7897
+HTTP_PROXY=http://127.0.0.1:7897
 ```
+
+完整变量（含 P1 新链路的数据库、预算、阈值、限速）见 [`.env.example`](.env.example)。
 
 *   **获取 Telegram Token**: 在 Telegram 中联系 [@BotFather](https://t.me/BotFather) 创建新机器人获取 Token。
 *   **获取 Chat ID**: 将你的机器人拉入群组，或直接私聊，通过相关工具或 API 获取 Chat ID。
@@ -90,12 +92,43 @@ npm run dev
 在 Telegram 中与机器人交互 (需确保服务已启动):
 *   `/check <参数>`: 手动触发对特定目标的分析 (具体参数格式请参考内部文档或代码)。
 
+## 🚧 新链路：持续观察钱包画像与仓位变化（P1 影子可用）
+
+`main` 上仍在跑的是「价格异动 → 查可疑钱包」的链路（默认 `PIPELINE=sentinel`，行为不变）。
+新增的 **`PIPELINE=ledger`** 链路按 [钱包画像与资金动向改进方案](docs/plans/wallet-profile-capital-flow-plan.md) 的
+**P0 + P1** 实现：持续采集 → SQLite 账本 → 持仓变化/退出报告，默认**影子运行**（只记录不发送）。
+
+* 来源契约核验结果与缺口：[`docs/contract-report.md`](docs/contract-report.md)（含脱敏样例 `tests/fixtures/contracts/`）
+* 实现说明与验收对照：[`docs/p1-implementation.md`](docs/p1-implementation.md)
+
+```bash
+npm test                                        # 37 个用例：契约 / 账本 / 行为 / 报告 / 限速 / 备份恢复
+npm run shadow                                  # 影子运行（真实来源、不发 Telegram、明细落 data/shadow-*.json）
+node dist/tools/shadow-run.js --market <slug>    # 指定市场
+node dist/tools/shadow-run.js --wallet 0x…       # 只看一个钱包
+npm run test-push                               # 推送内容测试：只发一条，用真实报告渲染器
+npm run probe                                   # 只读契约核验，刷新脱敏样例
+```
+
+实测（真实数据）：账本推导份数与来源快照 **1437/1437 完全一致**；候选发现 54 个/市场；缺口与截断全部显式登记。
+
+要点（与旧链路的区别）：
+
+- **持仓过程**而非成交额：快照建立观察起点，之后按份数变化报「加仓/减仓/退出」；减仓 10% 不会被说成清仓。
+- **事实/推断/缺失分开**：报告显式标注数据完整度（已核对/部分核对/证据不足）与已知缺口；失败不会变成「没有异常」。
+- **优先级与数据质量解耦**，且没有任何「钱包年龄」加分。
+- **报警不丢**：持久化队列 + **每分钟限速 + 每日上限**双闸，溢出合并为摘要而不是丢弃；重启后队列与采集进度恢复。
+
 ## 🗺️ 发展路线图 (Roadmap)
 
-我们致力于持续优化 Poly-sniper 的智能化程度：
+下一阶段以**钱包长期画像、持仓变化和资金动向**为重点，支持顺势与反向研究。
 
-- [ ] **大模型深度分析**: 接入 LLM (大语言模型) 辅助钱包行为分析，提供更自然、更深度的内幕交易嫌疑报告。
-- [ ] **智能阈值优化**: 根据市场资金沉淀量 (Volume/Liquidity) 动态调整异动报警的权重和阈值，减少误报，提高信号准确度。
+完整设计见 [钱包画像与资金动向改进方案](docs/plans/wallet-profile-capital-flow-plan.md)。
+
+- [x] **P0 · 可靠口径**：接口契约核验、失败/空/零分离、构建产物隔离（见 `docs/contract-report.md`）。
+- [x] **P1 · 首个可用版本**：SQLite 记录、关注名单、持仓变化与退出报告、持久化报警队列、备份与状态查询。
+- [ ] **P2 · 长期画像**：后台历史补全、跨月持仓过程、多时间尺度基线、非成交活动核对。
+- [ ] **P3 · 资金动向与复盘**：现金转入/转出与交易回款区分、跨市场同期调仓、决策与后续表现记录。
 
 ## 🤝 贡献 (Contributing)
 
