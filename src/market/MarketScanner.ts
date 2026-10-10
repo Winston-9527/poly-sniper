@@ -16,7 +16,7 @@ import { HttpClient, RequestBudget } from '../sources/http.js';
 import { GammaMarket, assignSyntheticKeys, CONTRACT_VERSION } from '../sources/contracts.js';
 import { slimPayload } from '../ledger/Collector.js';
 import { Config, RULES_VERSION } from '../config.js';
-import { Dec, cmp, decToNumber, decToString, parseDec, sub, abs, ZERO } from '../util/decimal.js';
+import { Dec, add as addDec, cmp, decToNumber, decToString, mul, parseDec, sub, abs, ZERO } from '../util/decimal.js';
 import { nowIso } from '../util/time.js';
 
 export interface MarketSnapshot {
@@ -265,13 +265,20 @@ export class MarketScanner {
      * 注意：gamma 的标量盘口只对应第一个结果，所以第二个结果必须走这里补。
      */
     async enrichBook(tokenId: string): Promise<{ ok: boolean; bestBid: string | null; bestAsk: string | null; spread: string | null; error?: string; requests: number }> {
-        const ask = await this.deps.http.getJson<{ price?: string }>(`https://clob.polymarket.com/price?token_id=${tokenId}&side=buy`, 'clob/price');
-        const bid = await this.deps.http.getJson<{ price?: string }>(`https://clob.polymarket.com/price?token_id=${tokenId}&side=sell`, 'clob/price');
-        const askP = ask.ok ? (ask.data.price ?? null) : null;
-        const bidP = bid.ok ? (bid.data.price ?? null) : null;
+        // 实测口径（与 gamma 的 bestBid/bestAsk 对齐过）：
+        //   /price?side=buy  → 买一价（bestBid）
+        //   /price?side=sell → 卖一价（bestAsk）
+        const bidRes = await this.deps.http.getJson<{ price?: string }>(`https://clob.polymarket.com/price?token_id=${tokenId}&side=buy`, 'clob/price');
+        const askRes = await this.deps.http.getJson<{ price?: string }>(`https://clob.polymarket.com/price?token_id=${tokenId}&side=sell`, 'clob/price');
+        const bidP = bidRes.ok ? (bidRes.data.price ?? null) : null;
+        const askP = askRes.ok ? (askRes.data.price ?? null) : null;
         let spread: string | null = null;
-        if (askP && bidP) spread = decToString(sub(parseDec(askP), parseDec(bidP))!);
-        if (!ask.ok && !bid.ok) return { ok: false, bestBid: null, bestAsk: null, spread: null, error: ask.error, requests: 2 };
+        if (bidP && askP) {
+            // 买一 > 卖一 是瞬时错位/口径异常：不写负数价差，按「未知」处理并留证据
+            const raw = sub(parseDec(askP), parseDec(bidP))!;
+            spread = cmp(raw, ZERO) > 0 ? decToString(raw) : null;
+        }
+        if (!bidRes.ok && !askRes.ok) return { ok: false, bestBid: null, bestAsk: null, spread: null, error: bidRes.error, requests: 2 };
         return { ok: true, bestBid: bidP, bestAsk: askP, spread, requests: 2 };
     }
 
@@ -279,7 +286,7 @@ export class MarketScanner {
      * 为异动市场补一次成交流水（1 页 = 500 笔），用于报告里的「谁在动」。
      * 同一市场在 freshMinutes 内不重复拉取；只存原始记录 + 登记钱包，不写入候选/关注名单。
      */
-    async ensureTradesFor(conditionId: string, opts: { freshMinutes?: number } = {}): Promise<{ ok: boolean; rows: number; skipped?: string; error?: string }> {
+    async ensureTradesFor(conditionId: string, opts: { freshMinutes?: number; windowHours?: number } = {}): Promise<{ ok: boolean; rows: number; skipped?: string; error?: string }> {
         const freshMinutes = opts.freshMinutes ?? 10;
         const last = this.repos.db.get<{ observed_at: string }>(
             `SELECT observed_at FROM source_records WHERE source='data-api/trades' AND market_condition_id=? ORDER BY id DESC LIMIT 1`,
@@ -294,10 +301,19 @@ export class MarketScanner {
             return { ok: false, rows: 0, error: r.error };
         }
         const keyed = assignSyntheticKeys(r.data);
+        const observedAt = nowIso();
+        // 聚合出「谁在动」并存成一条小记录：
+        // 原始页会因体积上限被截断（截断后 movers 读不出），所以聚合结果单独落库。
+        const movers = MarketScanner.aggregateMovers(keyed as unknown as Record<string, unknown>[], opts.windowHours ?? 6, 5);
         this.repos.db.tx(() => {
             this.repos.insertSourceRecord({
                 source: 'data-api/trades', sourceKey: `trades:${conditionId}:anomaly`, syntheticKey: true, wallet: null,
-                conditionId, payload: slimPayload(keyed), eventAt: keyed[0]?.eventAt ?? null, observedAt: nowIso(), contractVersion: CONTRACT_VERSION,
+                conditionId, payload: slimPayload(keyed), eventAt: keyed[0]?.eventAt ?? null, observedAt, contractVersion: CONTRACT_VERSION,
+            });
+            this.repos.insertSourceRecord({
+                source: 'derived/movers', sourceKey: `movers:${conditionId}:${observedAt}`, syntheticKey: true, wallet: null,
+                conditionId, payload: JSON.stringify({ movers, rows: keyed.length, windowHours: opts.windowHours ?? 6 }),
+                eventAt: observedAt, observedAt, contractVersion: CONTRACT_VERSION,
             });
             for (const t of keyed) this.repos.ensureWallet(t.wallet);
         });
@@ -308,33 +324,41 @@ export class MarketScanner {
      * 「谁在动」：从最近落库的成交流水里取该市场窗口内成交额最大的几个钱包。
      * 只报告已获取到的页，并注明口径（不宣称全市场）。
      */
-    recentMovers(conditionId: string, limit = 3, windowHours = 6): { wallet: string; buy: string; sell: string; trades: number }[] {
-        const rows = this.repos.db.all<{ payload: string }>(
-            `SELECT payload FROM source_records WHERE source='data-api/trades' AND market_condition_id=? ORDER BY id DESC LIMIT 4`,
+    recentMovers(conditionId: string, limit = 3): { wallet: string; buy: string; sell: string; trades: number }[] {
+        const row = this.repos.db.get<{ payload: string }>(
+            `SELECT payload FROM source_records WHERE source='derived/movers' AND market_condition_id=? ORDER BY id DESC LIMIT 1`,
             conditionId,
         );
-        if (!rows.length) return [];
+        if (!row) return [];
+        try {
+            const parsed = JSON.parse(row.payload) as { movers?: unknown };
+            const arr = Array.isArray(parsed.movers) ? parsed.movers as { wallet: string; buy: string; sell: string; trades: number }[] : [];
+            return arr.slice(0, limit);
+        } catch { return []; }
+    }
+
+    /** 把成交流水聚合成「谁在动」（金额用精确十进制相乘，不做二进制浮点累加） */
+    static aggregateMovers(rows: Record<string, unknown>[], windowHours: number, limit: number): { wallet: string; buy: string; sell: string; trades: number }[] {
         const since = new Date(Date.now() - windowHours * 3600_000).toISOString();
-        const agg = new Map<string, { wallet: string; buy: number; sell: number; trades: number }>();
-        for (const r of rows) {
-            let arr: Record<string, unknown>[];
-            try { const parsed = JSON.parse(r.payload) as unknown; arr = Array.isArray(parsed) ? parsed as Record<string, unknown>[] : []; } catch { continue; }
-            for (const t of arr) {
-                const at = t.eventAt ? String(t.eventAt) : null;
-                if (!at || at < since) continue;
-                const wallet = String(t.wallet ?? '');
-                if (!wallet) continue;
-                const size = parseDec(t.size === null || t.size === undefined ? null : String(t.size));
-                const price = parseDec(t.price === null || t.price === undefined ? null : String(t.price));
-                const notional = size !== null && price !== null ? Math.abs(decToNumber(size * price / (10n ** 18n)) ?? 0) : 0;
-                const a = agg.get(wallet) ?? { wallet, buy: 0, sell: 0, trades: 0 };
-                if (String(t.side) === 'BUY') a.buy += notional; else if (String(t.side) === 'SELL') a.sell += notional;
-                a.trades++;
-                agg.set(wallet, a);
-            }
+        const agg = new Map<string, { wallet: string; buy: Dec; sell: Dec; trades: number }>();
+        for (const t of rows) {
+            const at = t.eventAt ? String(t.eventAt) : null;
+            if (!at || at < since) continue;
+            const wallet = String(t.wallet ?? '');
+            if (!wallet) continue;
+            const size = parseDec(t.size === null || t.size === undefined ? null : String(t.size));
+            const price = parseDec(t.price === null || t.price === undefined ? null : String(t.price));
+            const notional = size !== null && price !== null ? abs(mul(size, price)) : null;
+            const a = agg.get(wallet) ?? { wallet, buy: ZERO, sell: ZERO, trades: 0 };
+            if (String(t.side) === 'BUY') { if (notional !== null) a.buy += notional; }
+            else if (String(t.side) === 'SELL') { if (notional !== null) a.sell += notional; }
+            a.trades++;
+            agg.set(wallet, a);
         }
-        return [...agg.values()].sort((x, y) => (y.buy + y.sell) - (x.buy + x.sell)).slice(0, limit)
-            .map((a) => ({ wallet: a.wallet, buy: a.buy.toFixed(0), sell: a.sell.toFixed(0), trades: a.trades }));
+        return [...agg.values()]
+            .sort((x, y) => cmp(addDec(y.buy, y.sell)!, addDec(x.buy, x.sell)!) as number)
+            .slice(0, limit)
+            .map((a) => ({ wallet: a.wallet, buy: decToString(a.buy) ?? '0', sell: decToString(a.sell) ?? '0', trades: a.trades }));
     }
 
     /** 持久化异动候选 */

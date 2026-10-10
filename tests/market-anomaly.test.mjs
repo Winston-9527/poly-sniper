@@ -176,7 +176,8 @@ test('谁在动：补一次成交流水后，报告里能看到具体钱包与�
 });
 
 test('盘口补充：CLOB 双边价自己算价差（第二结果也能补上，不再写「未取到」）', async () => {
-    const prices = { buy: '0.37', sell: '0.35' };
+    // 实测口径：side=buy → 买一价；side=sell → 卖一价
+    const prices = { buy: '0.35', sell: '0.37' };
     const fakeHttpResponse = (url) => {
         if (url.includes('side=buy')) return { ok: true, data: { price: prices.buy }, status: 200, ms: 1, url };
         if (url.includes('side=sell')) return { ok: true, data: { price: prices.sell }, status: 200, ms: 1, url };
@@ -189,6 +190,14 @@ test('盘口补充：CLOB 双边价自己算价差（第二结果也能补上，
     assert.equal(book.bestAsk, '0.37');
     assert.equal(book.spread, '0.02', '价差由买/卖自行相减（精确十进制）');
     assert.equal(book.requests, 2, '只用 2 个请求');
+
+    // 买一 > 卖一（瞬时错位）时不写负数价差
+    const inverted = mkApp({ httpHandler: async (url) => ({ ok: true, data: { price: url.includes('side=buy') ? '0.40' : '0.38' }, status: 200, ms: 1, url }) });
+    const b2 = await inverted.scanner.enrichBook(T_NO);
+    assert.equal(Number(b2.bestBid), 0.4);
+    assert.equal(Number(b2.bestAsk), 0.38);
+    assert.equal(b2.spread, null, '负价差按未知处理，不显示 -0.02');
+    inverted.close();
     app.close();
 });
 

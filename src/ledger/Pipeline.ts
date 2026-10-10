@@ -403,17 +403,16 @@ export class LedgerPipeline {
                 }
             }
 
-            // ---- 谁在动：给异动市场补一次成交流水（同市场 10 分钟内不重复拉）----
-            if (moverPulls < cfg.rules.marketMoverPullsPerCycle) {
-                const mv = await this.deps.scanner.ensureTradesFor(cand.conditionId);
-                if (mv.ok && !mv.skipped) moverPulls++;
-            }
-
             const rec = this.deps.scanner.recordAnomaly(cand, snap);
             if (rec.inserted) result.created++;
             const row = this.repos.db.get<MarketAnomalyRow & Record<string, unknown>>('SELECT * FROM market_anomalies WHERE id=?', rec.id);
             if (!row) continue;
             if (this.cycleMarketEnqueued >= cfg.push.maxMarketPerCycle) continue;
+            // ---- 谁在动：只给「真要入队」的异动补成交流水（预算花在用户看得见的那几条上）----
+            if (moverPulls < cfg.rules.marketMoverPullsPerCycle) {
+                const mv = await this.deps.scanner.ensureTradesFor(cand.conditionId);
+                if (mv.ok && !mv.skipped) moverPulls++;
+            }
             const movers = this.deps.scanner.recentMovers(cand.conditionId, 3);
             const rep = this.reports.marketAnomalyReport(row as unknown as MarketAnomalyRow, { movers, shadow: cfg.shadowMode });
             const enq = this.deps.outbox.enqueue(`alert:${cand.dedupeKey}`, {

@@ -120,9 +120,12 @@ export class Reports {
             const d = Number(a.delta ?? 0);
             lines.push(`现价：${fmtQty(a.price_after)}（${a.window_minutes} 分钟 ${fmtQty(a.price_before)} → ${fmtQty(a.price_after)}，${(d * 100).toFixed(1)} 个百分点）`);
         }
-        const book = a.best_bid && a.best_ask
-            ? `买 ${fmtQty(a.best_bid)} / 卖 ${fmtQty(a.best_ask)}${a.spread ? `（价差 ${fmtQty(a.spread)}）` : ''}`
-            : '未取到';
+        let book = '未取到';
+        if (a.best_bid && a.best_ask) {
+            const inverted = Number(a.best_bid) > Number(a.best_ask);
+            book = `买 ${fmtQty(a.best_bid)} / 卖 ${fmtQty(a.best_ask)}`
+                + (a.spread ? `（价差 ${fmtQty(a.spread)}）` : inverted ? '（买一高于卖一：瞬时错位，价差按未知处理）' : '（价差未取到）');
+        }
         lines.push(`盘口：${book}`);
         const parts: string[] = [`24h 成交 ${fmtCompactUsd(a.volume_24h)}`, `流动性 ${fmtCompactUsd(a.liquidity)}`];
         const c1 = Reports.ratioToPct(a.change_1h), c24 = Reports.ratioToPct(a.change_24h);
