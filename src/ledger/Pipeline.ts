@@ -11,6 +11,7 @@ import { AlertOutbox } from '../alerts/Outbox.js';
 import { Reports, BehaviorRow, MarketAnomalyRow } from '../report/Reports.js';
 import { buildBehavior, ChangeForBehavior, PriorityRules, isReactivation } from './Behaviors.js';
 import { MarketScanner, MarketSnapshot, AnomalyCandidate, AnomalyRules, detectAnomaly, anomalyRulesFromConfig } from '../market/MarketScanner.js';
+import { GammaMarket } from '../sources/contracts.js';
 import { decToString, fromDb, parseDec, mul, div, decToNumber, Dec, ZERO } from '../util/decimal.js';
 import { nowIso } from '../util/time.js';
 
@@ -263,6 +264,21 @@ export class LedgerPipeline {
         }
 
         // ---- 4b. 推送：市场元数据 + 单钱包聚合卡片 ----
+        // 长尾聚焦同样适用于钱包事件：体育/电竞盘与高频结算市场里的钱包变化不推
+        // （用户明确不要这些；市场异动侧已排除，钱包侧此前会漏进来）
+        const marketScanner = this.deps.scanner;
+        if (marketScanner) {
+            let dropped = 0;
+            for (let i = pushRows.length - 1; i >= 0; i--) {
+                const cid = pushRows[i]?.condition_id;
+                if (!cid) continue;
+                const m = this.repos.market(cid);
+                if (!m) continue;
+                const why = marketScanner.exclusionReason({ slug: m.slug ?? '', endDate: m.end_date ?? undefined } as unknown as GammaMarket);
+                if (why) { pushRows.splice(i, 1); dropped++; }
+            }
+            if (dropped > 0) this.deps.log(`[market] 钱包事件跳过 ${dropped} 条：所属市场属于已排除类别（体育/电竞/高频结算）`);
+        }
         if (pushRows.length) {
             // 报告必须有市场维度：先补齐市场元数据（每市场一次；有预算才发请求；失败不阻断推送）
             const cids = [...new Set(pushRows.map((r) => r.condition_id).filter((x): x is string => !!x))].slice(0, 3);

@@ -295,3 +295,16 @@ test('链接与金额：钱包指向 Polymarket 持仓页（不是 Polygonscan�
     assert.match(dustBody, /灰尘级/, '真正的灰尘级成交（<$1）有标注');
     app.close();
 });
+
+test('钱包事件也做长尾过滤：体育/电竞市场里的钱包变化不推', async () => {
+    const app = mkApp();
+    // 两个市场：一个体育（cs2，应被排除）、一个长尾（保留）
+    seedMarket(app.repos);
+    const app2 = app;
+    app2.repos.upsertMarket({ conditionId: '0xcs2market', slug: 'cs2-fal2-ts7-2026-10-09', question: 'CS2: FAL2 vs TS7', endDate: '2026-10-12T00:00:00Z' });
+    const excluded = app2.scanner.exclusionReason({ slug: 'cs2-fal2-ts7-2026-10-09', endDate: '2026-10-12T00:00:00Z' });
+    assert.match(String(excluded), /sports_esports_slug:cs2/);
+    const kept = app2.scanner.exclusionReason({ slug: 'will-thomas-massie-win-the-2028-republican-presidential-nomination', endDate: '2028-01-01T00:00:00Z' });
+    assert.equal(kept, null);
+    app.close();
+});
