@@ -191,7 +191,13 @@ export class Reports {
         }
         lines.push(`📕 盘口 ${book}${a.kind === 'spread_widen' ? ' 🟡 走阔' : ''}`);
 
-        if (a.kind !== 'price_move') lines.push(`⚡ ${escapeHtml(a.reason)}`);
+        if (a.kind !== 'price_move') {
+            // 盘口走阔的原因串里重复了「买/卖」（📕 行已经写过），这里去掉前缀只留变化证据
+            const reasonText = a.kind === 'spread_widen'
+                ? a.reason.replace(/^盘口走阔：买 [^/，]+ \/ 卖 [^，]+，/, '')
+                : a.reason;
+            lines.push(`⚡ ${escapeHtml(reasonText)}`);
+        }
 
         const bg: string[] = [`24h 成交 ${fmtCompactUsd(a.volume_24h)}`, `流动性 ${fmtCompactUsd(a.liquidity)}`];
         const c1 = Reports.ratioToPct(a.change_1h);

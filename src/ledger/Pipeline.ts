@@ -448,7 +448,9 @@ export class LedgerPipeline {
             // 之后同一条异动的「谁在动」里就能带出画像分（而不是永远显示未采集）。
             for (const mv of movers) {
                 this.repos.watch(mv.wallet, {
-                    marketConditionId: cand.conditionId, source: 'market_anomaly_mover', tier: 2,
+                    // tier 1 + nextCollectAt=null：排到采集队列最前面，下一轮就采，尽快让画像分出现
+                    // （不是提高每轮采集上限，只是让「谁在动」这些钱包插队）
+                    marketConditionId: cand.conditionId, source: 'market_anomaly_mover', tier: 1, nextCollectAt: null,
                     reason: `市场异动「谁在动」：${cand.kind}（本市场最近 ${mv.trades} 笔，买 $${mv.buy} / 卖 $${mv.sell}）`,
                 });
             }

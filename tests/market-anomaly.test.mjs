@@ -359,3 +359,33 @@ test('字段语义按 kind 区分：成交量突增不能把「成交量」当�
     assert.match(body, /6\.1 倍/);
     app.close();
 });
+
+test('盘口走阔：买/卖只出现一次（📕 行写，⚡ 行只留「较上一条放大」的证据）', () => {
+    const app = mkApp();
+    seedMarket(app.repos);
+    const rec = app.repos.insertMarketAnomaly({
+        dedupeKey: 'ma:spread:1', conditionId: CID, tokenId: TOKEN, outcome: 'Yes', kind: 'spread_widen',
+        windowMinutes: 5, priceBefore: '0.34', priceAfter: '0.35', delta: '0.02',
+        bestBid: '0.35', bestAsk: '0.37', spread: '0.02', volume24h: '50000', liquidity: '20000',
+        change1h: null, change24h: null, priority: 'high',
+        reason: '盘口走阔：买 0.35 / 卖 0.37，价差 0.02（占中间价 5.6%；较上一条 0.01 放大 2.0 倍，阈值 2 倍）',
+        dataQuality: 'verified', ruleVersion: 'p1-rules-2',
+        eventAt: '2026-10-10T12:00:00.000Z', observedAt: '2026-10-10T12:00:01.000Z',
+    });
+    const row = app.repos.db.get('SELECT * FROM market_anomalies WHERE id=?', rec.id);
+    const body = new Reports(app.repos, app.cfg).marketAnomalyReport(row, {}).body;
+    assert.equal(body.split('买 0.35').length - 1, 1, '买价只出现一次（不再重复）');
+    assert.match(body, /⚡ 价差 0\.02（占中间价 5\.6%；较上一条 0\.01 放大 2\.0 倍/, '⚡ 行保留变化证据');
+    app.close();
+});
+
+test('「谁在动」钱包插队采集：tier 1 且立即到期，排在普通候选之前', () => {
+    const app = mkApp();
+    seedMarket(app.repos);
+    const W = '0x40e4d8ad998bea126b20f3534b540fbf34866ef7';
+    app.repos.watch('0x' + '1'.repeat(40), { marketConditionId: CID, source: 'significant_trade', tier: 2, reason: '普通候选' });
+    app.repos.watch(W, { marketConditionId: CID, source: 'market_anomaly_mover', tier: 1, nextCollectAt: null, reason: '谁在动' });
+    const due = app.repos.dueWatch(new Date().toISOString(), 10).map((r) => String(r.address));
+    assert.equal(due[0], W, '谁在动的钱包排在最前（下一轮就采集）');
+    app.close();
+});
