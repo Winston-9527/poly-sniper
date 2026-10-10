@@ -198,7 +198,9 @@ export function loadConfig(): Config {
             marketScanPages: envNum('MARKET_SCAN_PAGES', 5),
             marketScanOrders: envList('MARKET_SCAN_ORDERS', ['volume24hr', 'liquidity']),
             marketMinHoursToEnd: envNum('MARKET_MIN_HOURS_TO_END', 24),
-            marketExcludePrefixes: envList('MARKET_EXCLUDE_PREFIXES', ['nba', 'nfl', 'mlb', 'nhl', 'ncaa', 'cbb', 'cfb', 'wnba', 'ufc', 'box', 'f1', 'atp', 'wta', 'epl', 'efl', 'elc', 'ucl', 'uel', 'bun', 'serie', 'ligue', 'laliga', 'mls', 'tur', 'kbo', 'npb', 'ipl', 'cric', 'cs2', 'val', 'lol', 'dota2', 'rl', 'cod', 'soccer', 'tennis', 'basketball']),
+            marketExcludePrefixes: envList('MARKET_EXCLUDE_PREFIXES', ['nba', 'nfl', 'mlb', 'nhl', 'ncaa', 'cbb', 'cfb', 'wnba', 'ufc', 'box', 'f1', 'atp', 'wta', 'epl', 'efl', 'elc', 'ucl', 'uel', 'bun', 'serie', 'ligue', 'laliga', 'mls', 'tur', 'kbo', 'npb', 'ipl', 'cric', 'cs2', 'val', 'lol', 'dota2', 'rl', 'cod', 'soccer', 'tennis', 'basketball',
+                // 联赛码补充（实测漏过的：澳大利亚 NBL、韩国 KBL、女足世预赛…）
+                'bknbl', 'nbl', 'kbl', 'cba', 'fiba', 'euroleague', 'eurocup', 'acb', 'wwc', 'wwcquefa', 'fifa', 'concacaf', 'afcon', 'hoops', 'basket']),
             marketExcludeSlugRegex: process.env.MARKET_EXCLUDE_SLUG_REGEX ?? '(updown|up-or-down|hourly|-(1h|5m|15m|30m|1m)-)',
             marketExcludeKeywords: envList('MARKET_EXCLUDE_KEYWORDS', [
                 // 电竞赛事（slug 常以 will 开头，首段规则抓不到）

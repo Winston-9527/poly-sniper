@@ -233,7 +233,7 @@ test('长尾聚焦：排除高频结算（小时级币价盘/当天球赛）与�
     assert.match(String(sc.exclusionReason({ slug: 'cs2-navi-vs-faze-bo3', endDate: iso(100) })), /sports_esports_slug:cs2/);
     assert.match(String(sc.exclusionReason({ slug: 'nba-lal-bos-2026-12-25', endDate: iso(1000) })), /sports_esports_slug:nba/);
     // 高频模式：updown/hourly/15m/1h（结束时间再远也排除）
-    assert.equal(sc.exclusionReason({ slug: 'bitcoin-updown-15m-2026-10-10-1500', endDate: iso(300) }), 'high_frequency_slug');
+    assert.match(String(sc.exclusionReason({ slug: 'bitcoin-updown-15m-2026-10-10-1500', endDate: iso(300) })), /same_day_slug|high_frequency_slug/);
     assert.equal(sc.exclusionReason({ slug: 'eth-hourly-price-2026-11-01', endDate: iso(400) }), 'high_frequency_slug');
     // 距结束不足 24h：小时级币价盘、当天球赛（非联赛 slug 也能挡住）
     assert.match(String(sc.exclusionReason({ slug: 'will-it-rain-in-nyc-today', endDate: iso(3) })), /settles_soon/);
@@ -306,5 +306,20 @@ test('钱包事件也做长尾过滤：体育/电竞市场里的钱包变化不�
     assert.match(String(excluded), /sports_esports_slug:cs2/);
     const kept = app2.scanner.exclusionReason({ slug: 'will-thomas-massie-win-the-2028-republican-presidential-nomination', endDate: '2028-01-01T00:00:00Z' });
     assert.equal(kept, null);
+    app.close();
+});
+
+test('长尾聚焦兜底：slug 带「今天/明天」日期段的一律排除（不认识的联赛码也挡住）', () => {
+    const app = mkApp();
+    const sc = app.scanner;
+    const today = new Date().toISOString().slice(0, 10);
+    const tomorrow = new Date(Date.now() + 24 * 3600_000).toISOString().slice(0, 10);
+    // 澳大利亚 NBL 篮球：前缀表里没有 bknbl，结束时间还得一周 → 靠日期段兜住
+    assert.match(String(sc.exclusionReason({ slug: `bknbl-per-new-${today}`, endDate: new Date(Date.now() + 7 * 86400_000).toISOString() })), /same_day_slug|sports_esports_slug:bknbl/);
+    assert.match(String(sc.exclusionReason({ slug: `some-new-league-abc-xyz-${tomorrow}`, endDate: new Date(Date.now() + 7 * 86400_000).toISOString() })), /same_day_slug/);
+    // 远期的日期段不该被误伤
+    assert.equal(sc.exclusionReason({ slug: 'will-x-happen-by-2027-12-31', endDate: new Date(Date.now() + 400 * 86400_000).toISOString() }), null);
+    // 女足世预赛前缀
+    assert.match(String(sc.exclusionReason({ slug: 'wwcquefa-isr-swi-2026-10-09-isr', endDate: new Date(Date.now() + 300 * 86400_000).toISOString() })), /sports_esports_slug:wwcquefa/);
     app.close();
 });

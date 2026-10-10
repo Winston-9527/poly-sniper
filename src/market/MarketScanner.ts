@@ -367,6 +367,13 @@ export class MarketScanner {
             // slug 用 - 分词：按「词边界」匹配，避免 nba 命中无关词
             if (new RegExp(`(^|-)${kw.replace(/[-]/g, '\\-')}(-|$)`).test(slug)) return `sports_esports_keyword:${kw}`;
         }
+        // slug 里带「今天/明天」的 ISO 日期段 → 当天或隔天结算（球赛、小时盘）。
+        // 这一条不需要知道是哪个联赛，能兜住 bknbl-…-2026-10-10 这类没见过的联赛码。
+        const dm = slug.match(/-(20\d\d-\d\d-\d\d)(?:-|$)/);
+        if (dm) {
+            const d = Date.parse(`${dm[1]}T00:00:00Z`);
+            if (Number.isFinite(d) && d <= Date.now() + 36 * 3600_000) return `same_day_slug:${dm[1]}`;
+        }
         const re = r.marketExcludeSlugRegex;
         if (re && new RegExp(re, 'i').test(slug)) return 'high_frequency_slug';
         const minH = r.marketMinHoursToEnd ?? 0;
