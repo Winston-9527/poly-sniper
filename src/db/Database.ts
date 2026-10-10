@@ -79,10 +79,36 @@ export class Db {
     migrate(): void {
         const sql = readFileSync(schemaPath(), 'utf8');
         this.exec(sql);
+        const added = this.ensureColumns();
+        if (added.length) console.log(`[db] 迁移新增列：${added.join(', ')}`);
         const row = this.get<{ v: number }>('SELECT COALESCE(MAX(version), 0) AS v FROM schema_migrations');
         if ((row?.v ?? 0) < 1) {
             this.run('INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?,?,?)', 1, 'p1-initial', new Date().toISOString());
         }
+        if ((row?.v ?? 0) < 2) {
+            this.run('INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?,?,?)', 2, 'p1-market-observations-book', new Date().toISOString());
+        }
+    }
+
+    /**
+     * 逐表补齐新增列。SQLite 不支持 ADD COLUMN IF NOT EXISTS，
+     * 所以升级已有库时只能先查 PRAGMA 再补 —— 否则老库会缺列。
+     */
+    private ensureColumns(): string[] {
+        const expected: Record<string, string[]> = {
+            market_observations: ['outcome', 'best_bid', 'best_ask', 'spread', 'last_trade_price', 'change_1h', 'change_24h'],
+        };
+        const added: string[] = [];
+        for (const [table, cols] of Object.entries(expected)) {
+            const have = new Set(this.all<{ name: string }>(`PRAGMA table_info(${table})`).map((r) => String(r.name)));
+            if (!have.size) continue;
+            for (const c of cols) {
+                if (have.has(c)) continue;
+                this.exec(`ALTER TABLE ${table} ADD COLUMN ${c} TEXT`);
+                added.push(`${table}.${c}`);
+            }
+        }
+        return added;
     }
 
     /** 一致性备份：VACUUM INTO。返回备份文件路径。 */

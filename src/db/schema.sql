@@ -273,17 +273,54 @@ CREATE TABLE IF NOT EXISTS data_gaps (
   UNIQUE(scope, key, reason)
 );
 
--- 市场观察（价格/成交量背景）
+-- 市场观察（价格/盘口/成交量背景）—— 这是「市场异动」判定的原始事实层
 CREATE TABLE IF NOT EXISTS market_observations (
   id            INTEGER PRIMARY KEY,
   condition_id  TEXT NOT NULL,
   token_id      TEXT,
-  price         TEXT,
+  outcome       TEXT,
+  price         TEXT,            -- 该 token 的价格（gamma outcomePrices / 盘口中间价）
+  best_bid      TEXT,
+  best_ask      TEXT,
+  spread        TEXT,
+  last_trade_price TEXT,
+  change_1h     TEXT,
+  change_24h    TEXT,
   volume_24h    TEXT,
   liquidity     TEXT,
   observed_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_market_obs ON market_observations(condition_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_market_obs_token ON market_observations(token_id, observed_at);
+
+-- 市场异动（首要信号）：价格异动 / 盘口走阔 / 成交量突增
+CREATE TABLE IF NOT EXISTS market_anomalies (
+  id             INTEGER PRIMARY KEY,
+  dedupe_key     TEXT NOT NULL UNIQUE,
+  condition_id   TEXT NOT NULL,
+  token_id       TEXT,
+  outcome        TEXT,
+  kind           TEXT NOT NULL,   -- price_move | spread_widen | volume_surge
+  window_minutes INTEGER,
+  price_before   TEXT,
+  price_after    TEXT,
+  delta          TEXT,            -- 价格变化（百分点差）
+  best_bid       TEXT,
+  best_ask       TEXT,
+  spread         TEXT,
+  volume_24h     TEXT,
+  liquidity      TEXT,
+  change_1h      TEXT,
+  change_24h     TEXT,
+  priority       TEXT NOT NULL,
+  reason         TEXT NOT NULL,
+  data_quality   TEXT NOT NULL,
+  rule_version   TEXT NOT NULL,
+  event_at       TEXT NOT NULL,
+  observed_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_anomalies_time ON market_anomalies(event_at DESC);
+CREATE INDEX IF NOT EXISTS idx_anomalies_market ON market_anomalies(condition_id, event_at DESC);
 
 -- 决策与跟进（用于评估报告是否有用）
 CREATE TABLE IF NOT EXISTS decisions (

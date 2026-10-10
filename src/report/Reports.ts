@@ -17,6 +17,22 @@ export function escapeHtml(s: string): string {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+export interface MarketObservationRow {
+    condition_id: string; token_id: string | null; outcome: string | null; price: string | null;
+    best_bid: string | null; best_ask: string | null; spread: string | null; last_trade_price: string | null;
+    change_1h: string | null; change_24h: string | null; volume_24h: string | null; liquidity: string | null;
+    observed_at: string;
+}
+
+/** 市场异动一行（market_anomalies） */
+export interface MarketAnomalyRow {
+    id: number; condition_id: string; token_id: string | null; outcome: string | null; kind: string;
+    window_minutes: number; price_before: string | null; price_after: string | null; delta: string | null;
+    best_bid: string | null; best_ask: string | null; spread: string | null; volume_24h: string | null;
+    liquidity: string | null; change_1h: string | null; change_24h: string | null;
+    priority: string; reason: string; data_quality: string; rule_version: string; event_at: string; observed_at: string;
+}
+
 export interface Magnitude { before?: string | null; after?: string | null; delta?: string | null; pct?: string | null; notional?: string | null; cashDelta?: string | null; outcome?: string | null; }
 
 export interface BehaviorRow {
@@ -58,16 +74,21 @@ export class Reports {
         return null;
     }
 
-    /** 市场背景：24h 成交量、流动性、该 token 现价与结束时间（缺失写「未知」，不猜 0） */
+    /** 市场背景：现价、盘口、24h 量/流动性、变化、结束时间（缺失写「未知」，不猜 0） */
     private marketBackgroundLines(conditionId: string | null, tokenId: string | null, wallet: string): string[] {
         if (!conditionId) return [];
         const obs = this.repos.latestMarketObservation(conditionId);
         const market = this.repos.market(conditionId);
         const snap = tokenId ? this.repos.snapshotForToken(wallet, tokenId) : undefined;
         const parts: string[] = [];
+        const price = snap?.price ?? obs?.price ?? null;
+        parts.push(price ? `现价 ${fmtQty(price)}` : '现价 未知');
+        const bid = obs?.best_bid ?? null, ask = obs?.best_ask ?? null, sp = obs?.spread ?? null;
+        parts.push(bid && ask ? `盘口 买 ${fmtQty(bid)}/卖 ${fmtQty(ask)}${sp ? `（价差 ${fmtQty(sp)}）` : ''}` : '盘口 未取到');
         parts.push(obs ? `24h 成交量 ${fmtCompactUsd(obs.volume_24h)}` : '24h 成交量 未知');
         parts.push(obs ? `流动性 ${fmtCompactUsd(obs.liquidity)}` : '流动性 未知');
-        if (snap?.price) parts.push(`该 token 现价 ${fmtQty(snap.price)}`);
+        const ch1 = Reports.ratioToPct(obs?.change_1h ?? null), ch24 = Reports.ratioToPct(obs?.change_24h ?? null);
+        if (ch1 || ch24) parts.push(`变化 1h ${ch1 ?? '未知'}｜24h ${ch24 ?? '未知'}`);
         if (market?.end_date) parts.push(`结束 ${String(market.end_date).slice(0, 10)}`);
         if (market?.closed === 1) parts.push('状态 已关闭');
         const lines = [`${parts.join('｜')}`];
@@ -75,6 +96,65 @@ export class Reports {
             lines.push('⚠️ 市场标题未取到（这是数据缺口：只能用 conditionId 定位，不代表该市场无数据）');
         }
         return lines;
+    }
+
+    // ---------- 市场异动（首要信号） ----------
+
+    static readonly ANOMALY_LABEL: Record<string, string> = {
+        price_move: '价格异动', spread_widen: '盘口走阔', volume_surge: '成交量突增',
+    };
+
+    /** 市场异动报告：市场 / 结果 / 现价变化 / 盘口 / 量 / 变化 / 链接 / 谁在动 */
+    marketAnomalyReport(a: MarketAnomalyRow, opts: { movers?: { wallet: string; buy: string; sell: string; trades: number }[]; shadow?: boolean } = {}): { title: string; body: string } {
+        const market = this.repos.market(a.condition_id);
+        const question = market?.question ?? `condition ${a.condition_id.slice(0, 12)}…`;
+        const url = this.marketUrl(market);
+        const label = Reports.ANOMALY_LABEL[a.kind] ?? a.kind;
+        const lines: string[] = [];
+        lines.push(`<b>【市场异动】${escapeHtml(label)}</b>${opts.shadow ? '  <i>[影子模式]</i>' : ''}`);
+        lines.push('');
+        lines.push(`市场：${url ? this.link(String(question).slice(0, 60), url) : escapeHtml(String(question))}`);
+        if (a.outcome) lines.push(`结果：${escapeHtml(a.outcome)}`);
+        lines.push(`触发原因：${escapeHtml(a.reason)}`);
+        if (a.kind === 'price_move' && a.price_before && a.price_after) {
+            const d = Number(a.delta ?? 0);
+            lines.push(`现价：${fmtQty(a.price_after)}（${a.window_minutes} 分钟 ${fmtQty(a.price_before)} → ${fmtQty(a.price_after)}，${(d * 100).toFixed(1)} 个百分点）`);
+        }
+        const book = a.best_bid && a.best_ask
+            ? `买 ${fmtQty(a.best_bid)} / 卖 ${fmtQty(a.best_ask)}${a.spread ? `（价差 ${fmtQty(a.spread)}）` : ''}`
+            : '未取到';
+        lines.push(`盘口：${book}`);
+        const parts: string[] = [`24h 成交 ${fmtCompactUsd(a.volume_24h)}`, `流动性 ${fmtCompactUsd(a.liquidity)}`];
+        const c1 = Reports.ratioToPct(a.change_1h), c24 = Reports.ratioToPct(a.change_24h);
+        if (c1 || c24) parts.push(`变化 1h ${c1 ?? '未知'}｜24h ${c24 ?? '未知'}`);
+        if (market?.end_date) parts.push(`结束 ${String(market.end_date).slice(0, 10)}`);
+        lines.push(parts.join('｜'));
+        lines.push('');
+        if (opts.movers?.length) {
+            lines.push(`<b>谁在动</b>（口径：最近已获取的成交流水，非全市场）`);
+            for (const m of opts.movers) {
+                lines.push(`• ${this.link(m.wallet.slice(0, 10) + '…', `https://polygonscan.com/address/${m.wallet}`)} 买 $${m.buy} / 卖 $${m.sell}（${m.trades} 笔）`);
+            }
+        } else {
+            lines.push('谁在动：暂无可用的成交流水（未取到该市场成交，是缺口不是「没人交易」）');
+        }
+        lines.push('');
+        lines.push(`<b>证据</b>：事件时间 ${escapeHtml(toDisplay(a.event_at))}｜观察时间 ${escapeHtml(toDisplay(a.observed_at))}｜窗口 ${a.window_minutes} 分钟｜规则 ${escapeHtml(a.rule_version)}`);
+        lines.push(`数据完整度：${qualityLabel(a.data_quality)}（异动判定基于本机观察到的窗口变化；1h/24h 变化来自来源口径，仅作背景）`);
+        if (url) lines.push(this.link('Polymarket 市场页', url));
+        else lines.push('市场页链接未取到（缺 slug；不伪造链接）');
+        return { title: `${label} · ${String(question).slice(0, 40)}`, body: lines.join('\n') };
+    }
+
+    /** 市场异动的摘要一行（当日汇总用） */
+    marketAnomalyLine(a: MarketAnomalyRow): string {
+        const market = this.repos.market(a.condition_id);
+        const name = market?.question ? String(market.question).slice(0, 34) : `condition ${a.condition_id.slice(0, 10)}…`;
+        const label = Reports.ANOMALY_LABEL[a.kind] ?? a.kind;
+        const detail = a.kind === 'price_move' && a.price_before && a.price_after
+            ? `${fmtQty(a.price_before)}→${fmtQty(a.price_after)}`
+            : a.kind === 'volume_surge' ? '24h 量突增' : '盘口走阔';
+        return `${label}｜${name}｜${detail}`;
     }
 
     /** 事件一行摘要（合并摘要与卡片共用）：市场名｜钱包短地址｜金额（%）｜优先级 */
@@ -365,6 +445,12 @@ export class Reports {
     }
 
     static unixToDisplay(sec: number | null): string { return toDisplay(unixToIso(sec)); }
+    /** 比值 → 百分比字符串（来源直接给的 1h/24h 变化是比值，如 -0.1225 → -12.3%） */
+    static ratioToPct(v: string | null | undefined): string | null {
+        if (v === null || v === undefined || v === '') return null;
+        const n = Number(v);
+        return Number.isFinite(n) ? `${(n * 100).toFixed(1)}%` : null;
+    }
     static fmtPct(v: number | null): string { return v === null ? '未知' : `${(v * 100).toFixed(1)}%`; }
     static fmtDec(v: ReturnType<typeof parseDec>): string { return decToString(v) ?? '未知'; }
     /** 供测试：金额不做二进制浮点累加 */

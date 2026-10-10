@@ -5,6 +5,14 @@
 import { Db, Row } from './Database.js';
 import { nowIso } from '../util/time.js';
 
+/** 市场观察一行（含盘口） */
+export interface MarketObservationRow {
+    condition_id: string; token_id: string | null; outcome: string | null; price: string | null;
+    best_bid: string | null; best_ask: string | null; spread: string | null; last_trade_price: string | null;
+    change_1h: string | null; change_24h: string | null; volume_24h: string | null; liquidity: string | null;
+    observed_at: string;
+}
+
 export interface SourceRecordInput {
     source: string;
     sourceKey: string;
@@ -121,8 +129,11 @@ export class Repos {
     }
 
     /** 市场最近一次观察（成交量/流动性背景）：报告里的市场维度来自这里 */
-    latestMarketObservation(conditionId: string): { volume_24h: string | null; liquidity: string | null; observed_at: string } | undefined {
-        return this.db.get('SELECT volume_24h, liquidity, observed_at FROM market_observations WHERE condition_id=? ORDER BY observed_at DESC LIMIT 1', conditionId);
+    latestMarketObservation(conditionId: string): MarketObservationRow | undefined {
+        return this.db.get<MarketObservationRow>(
+            `SELECT condition_id, token_id, outcome, price, best_bid, best_ask, spread, last_trade_price,
+                    change_1h, change_24h, volume_24h, liquidity, observed_at
+             FROM market_observations WHERE condition_id=? ORDER BY observed_at DESC LIMIT 1`, conditionId);
     }
 
     /** 活动里自带的 slug（来源免费提供）：用于补齐 markets 缺失的 slug，不额外发请求 */
@@ -576,12 +587,54 @@ export class Repos {
     }
 
     // ---------- 市场观察 ----------
-    insertMarketObservation(o: { conditionId: string; tokenId?: string | null; price?: string | null; volume24h?: string | null; liquidity?: string | null; observedAt: string }): void {
+    insertMarketObservation(o: {
+        conditionId: string; tokenId?: string | null; outcome?: string | null; price?: string | null;
+        bestBid?: string | null; bestAsk?: string | null; spread?: string | null; lastTradePrice?: string | null;
+        change1h?: string | null; change24h?: string | null;
+        volume24h?: string | null; liquidity?: string | null; observedAt: string;
+    }): void {
         this.db.run(
-            `INSERT INTO market_observations(condition_id, token_id, price, volume_24h, liquidity, observed_at) VALUES (?,?,?,?,?,?)`,
-            o.conditionId, o.tokenId ?? null, o.price ?? null, o.volume24h ?? null, o.liquidity ?? null, o.observedAt,
+            `INSERT INTO market_observations(condition_id, token_id, outcome, price, best_bid, best_ask, spread, last_trade_price, change_1h, change_24h, volume_24h, liquidity, observed_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            o.conditionId, o.tokenId ?? null, o.outcome ?? null, o.price ?? null, o.bestBid ?? null, o.bestAsk ?? null,
+            o.spread ?? null, o.lastTradePrice ?? null, o.change1h ?? null, o.change24h ?? null,
+            o.volume24h ?? null, o.liquidity ?? null, o.observedAt,
         );
     }
+
+    // ---------- 市场异动（首要信号） ----------
+    insertMarketAnomaly(a: {
+        dedupeKey: string; conditionId: string; tokenId: string | null; outcome: string | null;
+        kind: string; windowMinutes: number; priceBefore: string | null; priceAfter: string | null; delta: string | null;
+        bestBid: string | null; bestAsk: string | null; spread: string | null; volume24h: string | null; liquidity: string | null;
+        change1h: string | null; change24h: string | null; priority: string; reason: string; dataQuality: string;
+        ruleVersion: string; eventAt: string; observedAt: string;
+    }): { inserted: boolean; id: number } {
+        const res = this.db.run(
+            `INSERT OR IGNORE INTO market_anomalies(dedupe_key, condition_id, token_id, outcome, kind, window_minutes, price_before, price_after, delta,
+               best_bid, best_ask, spread, volume_24h, liquidity, change_1h, change_24h, priority, reason, data_quality, rule_version, event_at, observed_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            a.dedupeKey, a.conditionId, a.tokenId, a.outcome, a.kind, a.windowMinutes, a.priceBefore, a.priceAfter, a.delta,
+            a.bestBid, a.bestAsk, a.spread, a.volume24h, a.liquidity, a.change1h, a.change24h,
+            a.priority, a.reason, a.dataQuality, a.ruleVersion, a.eventAt, a.observedAt,
+        );
+        if (res.changes === 0) {
+            const row = this.db.get<{ id: number }>('SELECT id FROM market_anomalies WHERE dedupe_key=?', a.dedupeKey);
+            return { inserted: false, id: row?.id ?? 0 };
+        }
+        return { inserted: true, id: res.lastInsertRowid };
+    }
+
+    recentAnomalies(limit = 10): Row[] {
+        return this.db.all('SELECT * FROM market_anomalies ORDER BY event_at DESC LIMIT ?', limit);
+    }
+
+    anomaliesForCondition(conditionId: string, hours = 24, limit = 10): Row[] {
+        const since = new Date(Date.now() - hours * 3600_000).toISOString();
+        return this.db.all('SELECT * FROM market_anomalies WHERE condition_id=? AND event_at >= ? ORDER BY event_at DESC LIMIT ?', conditionId, since, limit);
+    }
+
+    anomalyCount(): number { return this.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM market_anomalies')?.n ?? 0; }
 
     // ---------- 手动关注的市场 ----------
     addWatchedMarket(conditionId: string, slug: string | null, note: string | null, now = nowIso()): void {

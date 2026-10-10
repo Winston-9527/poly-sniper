@@ -9,6 +9,7 @@ import { HttpClient, RequestBudget } from './sources/http.js';
 import { DataApiClient } from './sources/DataApi.js';
 import { ChainSource } from './sources/Chain.js';
 import { Collector } from './ledger/Collector.js';
+import { MarketScanner } from './market/MarketScanner.js';
 import { LedgerPipeline } from './ledger/Pipeline.js';
 import { AlertOutbox } from './alerts/Outbox.js';
 import { Reports } from './report/Reports.js';
@@ -16,7 +17,7 @@ import { LedgerBot } from './bot/Bot.js';
 
 export interface App {
     config: Config; db: Db; repos: Repos; http: HttpClient; budget: RequestBudget;
-    dataApi: DataApiClient; chain: ChainSource; collector: Collector; outbox: AlertOutbox;
+    dataApi: DataApiClient; chain: ChainSource; collector: Collector; scanner: MarketScanner; outbox: AlertOutbox;
     reports: Reports; pipeline: LedgerPipeline; bot: LedgerBot;
     log: (m: string) => void;
     close(): void;
@@ -38,11 +39,12 @@ export function createApp(overrides: { config?: Partial<Config>; dbPath?: string
     const collector = new Collector({ repos, dataApi, chain, config, budget, log });
     const reports = new Reports(repos, config);
     const outbox = new AlertOutbox(repos, config, async () => ({ ok: false, error: '未接入发送器' }), log);
-    const pipeline = new LedgerPipeline({ repos, collector, config, outbox, log, now: overrides.now });
+    const scanner = new MarketScanner({ repos, dataApi, http, config, budget, log });
+    const pipeline = new LedgerPipeline({ repos, collector, config, outbox, scanner, log, now: overrides.now });
     const bot = new LedgerBot({ config, repos, reports, pipeline, outbox, dataApi, log });
     outbox.setSender(bot.sender);
     return {
-        config, db, repos, http, budget, dataApi, chain, collector, outbox, reports, pipeline, bot, log,
+        config, db, repos, http, budget, dataApi, chain, collector, scanner, outbox, reports, pipeline, bot, log,
         close: () => db.close(),
     };
 }

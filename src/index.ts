@@ -49,7 +49,8 @@ async function main() {
             try {
                 const rep = await app.pipeline.runCycle({});
                 cycles++;
-                app.log(`[cycle] 处理 ${rep.processed} 个对象，新增事件 ${rep.events}，入队 ${rep.queued}，记录未推送 ${rep.suppressed}，投递 ${JSON.stringify(rep.flush)}`);
+                app.log(`[cycle] 市场扫描 ${rep.marketScan ? `${rep.marketScan.markets} 个市场/${rep.marketScan.observed} 个 token（${rep.marketScan.stoppedBecause}）` : '未启用'}；市场异动 新增 ${rep.marketAnomalies.created}/入队 ${rep.marketAnomalies.enqueued} ${JSON.stringify(rep.marketAnomalies.byKind)}`);
+                app.log(`[cycle] 钱包：处理 ${rep.processed} 个对象，新增事件 ${rep.events}，入队 ${rep.queued}，记录未推送 ${rep.suppressed}，投递 ${JSON.stringify(rep.flush)}`);
                 for (const w of rep.warnings.slice(0, 5)) app.log(`[cycle][warn] ${w}`);
                 if (cycles % backupEveryCycles === 0) {
                     const file = app.db.backupTo(app.config.backupDir);

@@ -8,8 +8,9 @@ import { Collector } from './Collector.js';
 import { PositionLedger, ActivityRow, LedgerIssue } from './PositionLedger.js';
 import { Profiler } from './Profiler.js';
 import { AlertOutbox } from '../alerts/Outbox.js';
-import { Reports, BehaviorRow } from '../report/Reports.js';
+import { Reports, BehaviorRow, MarketAnomalyRow } from '../report/Reports.js';
 import { buildBehavior, ChangeForBehavior, PriorityRules, isReactivation } from './Behaviors.js';
+import { MarketScanner, MarketSnapshot, AnomalyRules, detectAnomaly, anomalyRulesFromConfig } from '../market/MarketScanner.js';
 import { decToString, fromDb, parseDec, mul, div, decToNumber, Dec } from '../util/decimal.js';
 import { nowIso } from '../util/time.js';
 
@@ -29,6 +30,9 @@ export interface ProcessResult {
 export interface CycleReport {
     startedAt: string;
     finishedAt: string;
+    /** 市场扫描（首要信号） */
+    marketScan: { observed: number; markets: number; stoppedBecause: string } | null;
+    marketAnomalies: { created: number; enqueued: number; byKind: Record<string, number> };
     markets: string[];
     discovered: { market: string; added: number; skippedOverBudget: number; byEntry: Record<string, number> }[];
     processed: number;
@@ -49,9 +53,12 @@ export class LedgerPipeline {
     private lastCycleAt: string | null = null;
     /** 本轮已入队的报警数（每轮上限，防一轮打满消息） */
     private cycleEnqueued = 0;
+    /** 本轮已入队的市场异动数（独立上限：异动是首要信号，不被钱包事件挤掉） */
+    private cycleMarketEnqueued = 0;
 
     constructor(private deps: {
         repos: Repos; collector: Collector; config: Config; outbox: AlertOutbox;
+        scanner?: MarketScanner;
         log: (m: string) => void; now?: () => Date;
     }) {
         this.collector = deps.collector;
@@ -296,6 +303,10 @@ export class LedgerPipeline {
         const warnings: string[] = [];
         const cfg = this.deps.config;
         this.deps.outbox.recover();
+        this.cycleEnqueued = 0;
+        this.cycleMarketEnqueued = 0;
+        // ---- 首要信号：市场扫描与异动判定（先于钱包处理）----
+        const market = await this.runMarketScan();
         const discovered: CycleReport['discovered'] = [];
         const markets: string[] = [...(opts.markets ?? [])];
         for (const m of this.repos.listWatchedMarkets()) {
@@ -317,7 +328,6 @@ export class LedgerPipeline {
             if (d.skippedOverBudget > 0) warnings.push(`市场 ${m} 有 ${d.skippedOverBudget} 个候选因预算未纳入（已记缺口）`);
         }
 
-        this.cycleEnqueued = 0;
         const due = this.repos.dueWatch(nowIso(), cfg.budgets.walletsPerCycle);
         let processed = 0, events = 0, queued = 0, suppressed = 0;
         for (const row of due) {
@@ -339,7 +349,51 @@ export class LedgerPipeline {
         const flush = opts.flush === false ? null : await this.deps.outbox.flush();
         this.cycles++;
         this.lastCycleAt = nowIso();
-        return { startedAt: started, finishedAt: nowIso(), markets, discovered, processed, events, queued, suppressed, flush, warnings };
+        return { startedAt: started, finishedAt: nowIso(), marketScan: market.scan, marketAnomalies: market.anomalies, markets, discovered, processed, events, queued, suppressed, flush, warnings };
+    }
+
+    /**
+     * 市场扫描 + 异动判定 + 入队（首要信号）。
+     * 价格异动优先入队；被判为异动的 token 再用 CLOB 补精确盘口（少量请求）。
+     */
+    private async runMarketScan(): Promise<{ scan: { observed: number; markets: number; stoppedBecause: string } | null; anomalies: { created: number; enqueued: number; byKind: Record<string, number> } }> {
+        const cfg = this.deps.config;
+        const result = { created: 0, enqueued: 0, byKind: {} as Record<string, number> };
+        if (!this.deps.scanner) return { scan: null, anomalies: result };
+        const scan = await this.deps.scanner.scan({ pages: cfg.rules.marketScanPages });
+        const rules: AnomalyRules = anomalyRulesFromConfig(cfg);
+        const snapshots: MarketSnapshot[] = (scan as { snapshots?: MarketSnapshot[] }).snapshots ?? [];
+        let enriched = 0;
+        for (const cur of snapshots) {
+            if (!cur.tokenId || cur.price === null) continue;
+            const prev = this.deps.scanner.previousSnapshot(cur.tokenId, cur.observedAt);
+            const { candidates } = detectAnomaly(prev, cur, rules);
+            for (const cand of candidates) {
+                if (cand.priority === 'low') { result.byKind[cand.kind] = (result.byKind[cand.kind] ?? 0); continue; }
+                // 高优先级价格异动：补精确盘口（每次最多 3 个 token，避免请求放大）
+                let snap = cur;
+                if (cand.priority === 'high' && enriched < 3) {
+                    enriched++;
+                    const book = await this.deps.scanner.enrichBook(cur.tokenId);
+                    if (book.ok) snap = { ...cur, bestBid: book.bestBid ? parseDec(book.bestBid) : cur.bestBid, bestAsk: book.bestAsk ? parseDec(book.bestAsk) : cur.bestAsk, spread: book.spread ? parseDec(book.spread) : cur.spread };
+                }
+                const rec = this.deps.scanner.recordAnomaly(cand, snap);
+                result.byKind[cand.kind] = (result.byKind[cand.kind] ?? 0) + 1;
+                if (rec.inserted) result.created++;
+                // 入队（市场异动优先，且有自己的每轮上限，不与钱包事件互相挤占）
+                const row = this.repos.db.get<MarketAnomalyRow & Record<string, unknown>>('SELECT * FROM market_anomalies WHERE id=?', rec.id);
+                if (row && this.cycleMarketEnqueued < cfg.push.maxMarketPerCycle) {
+                    const movers = this.deps.scanner.recentMovers(cand.conditionId, 3);
+                    const rep = this.reports.marketAnomalyReport(row as unknown as MarketAnomalyRow, { movers, shadow: cfg.shadowMode });
+                    const enq = this.deps.outbox.enqueue(`alert:${cand.dedupeKey}`, {
+                        chatId: cfg.telegram.chatIds[0] ?? '', title: rep.title, body: rep.body,
+                        wallet: '', conditionId: cand.conditionId, priority: cand.priority, dataQuality: cand.dataQuality,
+                    });
+                    if (enq.inserted) { result.enqueued++; this.cycleMarketEnqueued++; }
+                }
+            }
+        }
+        return { scan: { observed: scan.observed, markets: scan.markets, stoppedBecause: scan.stoppedBecause }, anomalies: result };
     }
 
     stats(): { cycles: number; lastCycleAt: string | null } { return { cycles: this.cycles, lastCycleAt: this.lastCycleAt }; }

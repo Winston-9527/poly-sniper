@@ -251,10 +251,21 @@ export interface GammaMarket {
     eventSlug?: string;
     negRisk: boolean | null;
     closed: boolean | null;
+    active?: boolean | null;
     endDate?: string;
-    tokens: { tokenId: string; outcome: string; outcomeIndex: number }[];
-    volume24hr: string | null;
-    liquidity: string | null;
+    tokens: { tokenId: string; outcome: string; outcomeIndex: number; price?: string | null }[];
+    volume24hr?: string | null;
+    liquidity?: string | null;
+    /** 盘口（gamma 的标量字段对应 outcomeIndex 0）—— 可选：别的取数路径不一定带 */
+    bestBid?: string | null;
+    bestAsk?: string | null;
+    spread?: string | null;
+    lastTradePrice?: string | null;
+    /** gamma 直接给出的变化（作为背景，异常判定仍以本机观察到的窗口变化为主） */
+    change1h?: string | null;
+    change24h?: string | null;
+    change1w?: string | null;
+    openInterest?: string | null;
 }
 
 export function validateGammaMarkets(data: unknown): GammaMarket[] {
@@ -262,9 +273,10 @@ export function validateGammaMarkets(data: unknown): GammaMarket[] {
     return data.filter(isObj).map((m) => {
         const conditionId = typeof m.conditionId === 'string' ? m.conditionId : null;
         if (!conditionId) throw new ContractError('/markets 缺少 conditionId', snippet(m));
-        let tokenIds: string[] = [], outcomes: string[] = [];
+        let tokenIds: string[] = [], outcomes: string[] = [], prices: unknown[] = [];
         try { tokenIds = JSON.parse(String(m.clobTokenIds ?? '[]')); } catch { tokenIds = []; }
         try { outcomes = JSON.parse(String(m.outcomes ?? '[]')); } catch { outcomes = []; }
+        try { prices = JSON.parse(String(m.outcomePrices ?? '[]')); } catch { prices = []; }
         return {
             conditionId,
             slug: typeof m.slug === 'string' ? m.slug : undefined,
@@ -272,10 +284,19 @@ export function validateGammaMarkets(data: unknown): GammaMarket[] {
             eventSlug: undefined,
             negRisk: typeof m.negRisk === 'boolean' ? m.negRisk : null,
             closed: typeof m.closed === 'boolean' ? m.closed : null,
+            active: typeof m.active === 'boolean' ? m.active : null,
             endDate: typeof m.endDate === 'string' ? m.endDate : undefined,
-            tokens: tokenIds.map((t, i) => ({ tokenId: t, outcome: outcomes[i] ?? '', outcomeIndex: i })),
-            volume24hr: num(m.volume24hr),
-            liquidity: num(m.liquidity),
+            tokens: tokenIds.map((t, i) => ({ tokenId: t, outcome: outcomes[i] ?? '', outcomeIndex: i, price: num(prices[i]) })),
+            volume24hr: num(m.volume24hr ?? m.volumeNum),
+            liquidity: num(m.liquidity ?? m.liquidityNum),
+            bestBid: num(m.bestBid),
+            bestAsk: num(m.bestAsk),
+            spread: num(m.spread),
+            lastTradePrice: num(m.lastTradePrice),
+            change1h: num(m.oneHourPriceChange),
+            change24h: num(m.oneDayPriceChange),
+            change1w: num(m.oneWeekPriceChange),
+            openInterest: num(m.openInterest),
         };
     });
 }

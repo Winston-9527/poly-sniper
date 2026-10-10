@@ -82,8 +82,30 @@ export interface Config {
         incrementalOverlapHours: number;
         /** 单条告警冷却（分钟）：同一钱包/市场/行为过程 */
         alertCooldownMinutes: number;
+        // ---- 市场异动（首要信号）----
+        /** 价格异动阈值（概率差）：0.05 = 5 个百分点 */
+        marketPriceMove: number;
+        marketPriceMoveHigh: number;
+        /** 异动观察窗口（分钟） */
+        marketWindowMinutes: number;
+        /** 盘口走阔：spread/中间价 */
+        marketSpreadRatio: number;
+        marketSpreadRatioHigh: number;
+        /** 价差相对上一条的放大倍数（判定「变宽」而不是「本来宽」） */
+        marketSpreadGrowth: number;
+        /** 中间价下限（分币市场不判相对价差）与绝对价差下限 */
+        marketMinMidPrice: number;
+        marketMinAbsSpread: number;
+        /** 成交量突增倍数 */
+        marketVolumeSurge: number;
+        marketVolumeSurgeHigh: number;
+        /** 最低 24h 成交量 / 流动性（过滤死市场） */
+        marketMinVolume24h: number;
+        marketMinLiquidity: number;
+        /** 每轮扫描多少页活跃市场（每页 500 个市场） */
+        marketScanPages: number;
     };
-    push: { maxPerMinute: number; maxPerDay: number; maxHighPerDay: number; maxPerCycleAlerts: number; maxAttempts: number; retryBackoffSeconds: number[] };
+    push: { maxPerMinute: number; maxPerDay: number; maxHighPerDay: number; maxPerCycleAlerts: number; maxMarketPerCycle: number; maxAttempts: number; retryBackoffSeconds: number[] };
     /** 历史补全：只有在实现了可核验的补充来源后才打开 */
     backfill: { enabled: boolean };
     logLevel: 'debug' | 'info' | 'warn' | 'error';
@@ -131,6 +153,20 @@ export function loadConfig(): Config {
                 ? envList('BASELINE_WINDOWS_DAYS').map(Number).filter((n) => n > 0) : [30, 90],
             incrementalOverlapHours: envNum('INCREMENTAL_OVERLAP_HOURS', 3),
             alertCooldownMinutes: envNum('ALERT_COOLDOWN_MINUTES', 30),
+            // ---- 市场异动（首要信号）----
+            marketPriceMove: envNum('MARKET_PRICE_MOVE', 0.05),
+            marketPriceMoveHigh: envNum('MARKET_PRICE_MOVE_HIGH', 0.10),
+            marketWindowMinutes: envNum('MARKET_WINDOW_MINUTES', 15),
+            marketSpreadRatio: envNum('MARKET_SPREAD_RATIO', 0.10),
+            marketSpreadRatioHigh: envNum('MARKET_SPREAD_RATIO_HIGH', 0.25),
+            marketSpreadGrowth: envNum('MARKET_SPREAD_GROWTH', 1.5),
+            marketMinMidPrice: envNum('MARKET_MIN_MID_PRICE', 0.05),
+            marketMinAbsSpread: envNum('MARKET_MIN_ABS_SPREAD', 0.01),
+            marketVolumeSurge: envNum('MARKET_VOLUME_SURGE', 3),
+            marketVolumeSurgeHigh: envNum('MARKET_VOLUME_SURGE_HIGH', 8),
+            marketMinVolume24h: envNum('MARKET_MIN_VOLUME_24H', 5000),
+            marketMinLiquidity: envNum('MARKET_MIN_LIQUIDITY', 5000),
+            marketScanPages: envNum('MARKET_SCAN_PAGES', 3),
         },
         push: {
             maxPerMinute: envNum('MAX_ALERTS_PER_MIN', 6),
@@ -140,6 +176,8 @@ export function loadConfig(): Config {
             maxHighPerDay: envNum('MAX_HIGH_PER_DAY', 20),
             // 每轮最多入队几条（优先高优先级），其余事件照常记录但不推送
             maxPerCycleAlerts: envNum('MAX_ALERTS_PER_CYCLE', 4),
+            // 每轮最多入队几条市场异动（首要信号，独立于钱包事件上限）
+            maxMarketPerCycle: envNum('MAX_MARKET_ALERTS_PER_CYCLE', 6),
             maxAttempts: envNum('PUSH_MAX_ATTEMPTS', 5),
             retryBackoffSeconds: [30, 120, 600, 1800, 7200],
         },
