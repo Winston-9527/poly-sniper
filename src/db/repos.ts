@@ -166,6 +166,15 @@ export class Repos {
         );
     }
 
+    /** 最近一次钱包画像的 metrics（报告里要带画像分用）；没有则 null，不伪造 */
+    latestProfileMetrics(wallet: string): unknown | null {
+        const row = this.db.get<{ metrics: string }>(
+            `SELECT metrics FROM profile_versions WHERE wallet=? ORDER BY as_of DESC LIMIT 1`, wallet.toLowerCase(),
+        );
+        if (!row) return null;
+        try { return JSON.parse(row.metrics) as unknown; } catch { return null; }
+    }
+
     /** 加入关注名单（幂等）；不会因为再次命中而覆盖用户手动关注 */
     watch(address: string, opts: { marketConditionId?: string; source: string; tier: number; reason: string; nextCollectAt?: string | null; now?: string }): void {
         const now = opts.now ?? nowIso();

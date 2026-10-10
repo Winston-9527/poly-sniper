@@ -114,11 +114,14 @@ test('市场异动报告必须带：市场名、结果、现价变化、盘口�
     const row = app.repos.db.get('SELECT * FROM market_anomalies WHERE id=?', rec.id);
     const reports = new Reports(app.repos, app.cfg);
     const rep = reports.marketAnomalyReport(row, { movers: [{ wallet: '0xabc0000000000000000000000000000000000001', buy: '12000', sell: '0', trades: 3 }] });
-    assert.match(rep.body, /【市场异动】价格异动/);
+    assert.match(rep.body, /🟢📈 价格异动/);          // 涨=绿
+    assert.equal(rep.body.includes('证据'), false, '不再显示事件时间/规则版本那行');
+    assert.equal(/数据完整度/.test(rep.body), false, '已核对时不再显示数据完整度那行（不完整时才显示）');
     assert.match(rep.body, /Will X win\?/);
-    assert.match(rep.body, /盘口：买 0\.35 \/ 卖 0\.37（价差 0\.02）/);
+    assert.match(rep.body, /📕 盘口 买 0\.35 \/ 卖 0\.37（价差 0\.02）/);
+    assert.match(rep.body, /💰 现价 <b>0\.36<\/b> 🟢 \+6\.0 个点/, '现价带涨跌 emoji 与符号');
     assert.match(rep.body, /24h 成交 \$703/);
-    assert.match(rep.body, /变化 1h -12\.0%｜24h -38\.0%/);
+    assert.match(rep.body, /1h -12\.0% 🔴｜24h -38\.0% 🔴/, '变化带红绿 emoji（跌=红）');
     assert.match(rep.body, /polymarket\.com\/market\/test-market/, '必须给出市场链接');
     assert.match(rep.body, /谁在动/);
     assert.match(rep.body, /\$12,000/);
@@ -134,7 +137,7 @@ test('市场异动报告必须带：市场名、结果、现价变化、盘口�
     });
     const row2 = app2.repos.db.get("SELECT * FROM market_anomalies WHERE dedupe_key='ma:test:2'");
     const rep2 = new Reports(app2.repos, app2.cfg).marketAnomalyReport(row2, {});
-    assert.match(rep2.body, /盘口：未取到/);
+    assert.match(rep2.body, /📕 盘口 未取到/);
     assert.match(rep2.body, /市场页链接未取到/);
     app.close(); app2.close();
 });
@@ -171,7 +174,18 @@ test('谁在动：补一次成交流水后，报告里能看到具体钱包与�
     const row = app.repos.db.get('SELECT * FROM market_anomalies WHERE id=?', rec.id);
     const body = new Reports(app.repos, app.cfg).marketAnomalyReport(row, { movers: app.scanner.recentMovers(CID, 3) }).body;
     assert.match(body, /0xaaaaaaaa…/);
-    assert.match(body, /买 \$6,000 \/ 卖 \$0/);
+    assert.match(body, /🟢 <a href="https:\/\/polymarket\.com\/profile\/0xaaaaaaaa.*买 \$6,000（1 笔）/, '只有买入时只写买入（不写「/ 卖 $0」）');
+
+    // 画像分：采集过就必须带分；没采集过如实写「未采集」
+    app.repos.db.run(
+        `INSERT INTO profile_versions(wallet, as_of, coverage_from, coverage_to, coverage_complete, metrics, algorithm_version, created_at)
+         VALUES (?,?,?,?,?,?,?,?)`,
+        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '2026-10-10T00:00:00.000Z', '2025-01-01T00:00:00.000Z', '2026-10-10T00:00:00.000Z', 1,
+        JSON.stringify({ tradeNotional: { p90: '12000', samples: 40 }, distinctMarketsInCoverage: 8, positionValueCovered: '340000', coverage: { earliestObservedActivity: '2025-06-01T00:00:00.000Z', reachedSourceStart: true, truncated: false } }),
+        'p1-1', '2026-10-10T00:00:00.000Z',
+    );
+    const withScore = new Reports(app.repos, app.cfg).marketAnomalyReport(row, { movers: app.scanner.recentMovers(CID, 3) }).body;
+    assert.match(withScore, /🧭 画像 <b>\d+<\/b> 分（单笔规模 p90 \$12k｜专注度 8 个市场/, '采集过就要带画像分与明细');
     app.close();
 });
 
@@ -287,7 +301,7 @@ test('链接与金额：钱包指向 Polymarket 持仓页（不是 Polygonscan�
     }).body;
     assert.match(body, /https:\/\/polymarket\.com\/profile\/0x40e4d8ad998bea126b20f3534b540fbf34866ef7/, '钱包链接指向 Polymarket 持仓页');
     assert.equal(body.includes('polygonscan'), false, '不再出现 Polygonscan');
-    assert.match(body, /买 \$7\.84 \/ 卖 \$0/, '金额取整到分，不打印 18 位小数');
+    assert.match(body, /买 \$7\.84（1 笔）/, '金额取整到分，不打印 18 位小数');
     assert.equal(/灰尘级/.test(body), false, '$7.84 不算灰尘级');
     const dustBody = new Reports(app.repos, app.cfg).marketAnomalyReport(row, {
         movers: [{ wallet: W, buy: '0.42', sell: '0', trades: 1 }],

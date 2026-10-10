@@ -444,6 +444,14 @@ export class LedgerPipeline {
                 if (mv.ok && !mv.skipped) moverPulls++;
             }
             const movers = this.deps.scanner.recentMovers(cand.conditionId, 3);
+            // 「谁在动」的钱包顺带纳入关注名单：下一轮起就会采集它们的活动/持仓，
+            // 之后同一条异动的「谁在动」里就能带出画像分（而不是永远显示未采集）。
+            for (const mv of movers) {
+                this.repos.watch(mv.wallet, {
+                    marketConditionId: cand.conditionId, source: 'market_anomaly_mover', tier: 2,
+                    reason: `市场异动「谁在动」：${cand.kind}（本市场最近 ${mv.trades} 笔，买 $${mv.buy} / 卖 $${mv.sell}）`,
+                });
+            }
             const rep = this.reports.marketAnomalyReport(row as unknown as MarketAnomalyRow, { movers, shadow: cfg.shadowMode });
             const enq = this.deps.outbox.enqueue(`alert:${cand.dedupeKey}`, {
                 chatId: cfg.telegram.chatIds[0] ?? '', title: rep.title, body: rep.body,

@@ -10,6 +10,7 @@ import { Config } from '../config.js';
 import { decToString, fromDb, parseDec, pctString, decToNumber, mul, sumDec } from '../util/decimal.js';
 import { toDisplay, durationText, nowIso, unixToIso } from '../util/time.js';
 import { fmtUsd, fmtQty, fmtPct, fmtCompactUsd } from '../util/format.js';
+import { scoreWalletProfile, ScoreInput } from '../ledger/WalletScore.js';
 import { Profiler, ProfileMetrics } from '../ledger/Profiler.js';
 import { DataQuality, Priority } from '../ledger/Behaviors.js';
 
@@ -88,7 +89,9 @@ export class Reports {
         parts.push(obs ? `24h 成交量 ${fmtCompactUsd(obs.volume_24h)}` : '24h 成交量 未知');
         parts.push(obs ? `流动性 ${fmtCompactUsd(obs.liquidity)}` : '流动性 未知');
         const ch1 = Reports.ratioToPct(obs?.change_1h ?? null), ch24 = Reports.ratioToPct(obs?.change_24h ?? null);
-        if (ch1 || ch24) parts.push(`变化 1h ${ch1 ?? '未知'}｜24h ${ch24 ?? '未知'}`);
+        const n1 = obs?.change_1h === null || obs?.change_1h === undefined ? null : Number(obs.change_1h);
+        const n24 = obs?.change_24h === null || obs?.change_24h === undefined ? null : Number(obs.change_24h);
+        if (ch1 || ch24) parts.push(`1h ${ch1 ?? '未知'}${Reports.ratioEmoji(n1)}｜24h ${ch24 ?? '未知'}${Reports.ratioEmoji(n24)}`);
         if (market?.end_date) parts.push(`结束 ${String(market.end_date).slice(0, 10)}`);
         if (market?.closed === 1) parts.push('状态 已关闭');
         const lines = [`${parts.join('｜')}`];
@@ -104,51 +107,110 @@ export class Reports {
         price_move: '价格异动', spread_widen: '盘口走阔', volume_surge: '成交量突增',
     };
 
-    /** 市场异动报告：市场 / 结果 / 现价变化 / 盘口 / 量 / 变化 / 链接 / 谁在动 */
+    /** 涨=🟢 跌=🔴（绿涨红跌） */
+    static arrow(d: number | null): string {
+        if (d === null || !Number.isFinite(d) || d === 0) return '⚪';
+        return d > 0 ? '🟢' : '🔴';
+    }
+
+    static kindEmoji(kind: string, delta: number | null): string {
+        if (kind === 'spread_widen') return '📊';
+        if (kind === 'volume_surge') return '🔥';
+        if (delta === null) return '⚪';
+        return delta > 0 ? '🟢📈' : delta < 0 ? '🔴📉' : '⚪';
+    }
+
+    static ratioEmoji(v: number | null): string {
+        if (v === null || !Number.isFinite(v) || v === 0) return '';
+        return v > 0 ? ' 🟢' : ' 🔴';
+    }
+
+    /** 价格变化：+5.0 个点 / -5.0 个点（带符号，方便一眼看方向） */
+    static signedPctPoints(d: number): string {
+        const p = (d * 100).toFixed(1);
+        return `${d > 0 ? '+' : ''}${p} 个点`;
+    }
+
+    /**
+     * 「谁在动」的一条：地址链接 + 买卖金额 + **该钱包的画像分**。
+     * 画像分来自最近一次采集的画像（可核验的量：单笔规模/专注度/持仓/活跃时长/覆盖）；
+     * 没采集过就如实写「未采集」（并已在采集队列里，下一轮起带分），不编分数。
+     */
+    walletMoverLines(m: { wallet: string; buy: string; sell: string; trades: number }): string[] {
+        const w = m.wallet.toLowerCase();
+        const buyN = Number(m.buy), sellN = Number(m.sell);
+        const flows: string[] = [];
+        if (buyN > 0) flows.push(`买 ${fmtUsd(m.buy)}`);
+        if (sellN > 0) flows.push(`卖 ${fmtUsd(m.sell)}`);
+        const dust = buyN + sellN < 1 ? '（灰尘级，<$1）' : '';
+        const icon = buyN > 0 && sellN === 0 ? '🟢' : sellN > 0 && buyN === 0 ? '🔴' : '🟡';
+        const lines = [`${icon} ${this.link(w.slice(0, 10) + '…', `https://polymarket.com/profile/${w}`)} ${flows.join(' / ') || '买/卖金额未知'}（${m.trades} 笔）${dust}`];
+        const metrics = this.repos.latestProfileMetrics(w);
+        if (metrics) {
+            const sc = scoreWalletProfile(metrics as ScoreInput);
+            lines.push(`　　🧭 画像 <b>${sc.total}</b> 分（${sc.summary}）${sc.notes.length ? `⚠️ ${sc.notes[0]}` : ''}`);
+        } else {
+            lines.push('　　🧭 画像未采集（已入采集队列，下一轮起带分）');
+        }
+        return lines;
+    }
+
+    /**
+     * 市场异动报告：一眼看到「涨还是跌 / 现价 / 盘口 / 谁在动（含画像分）」。
+     * 事件时间与规则版本不再展示（用户要求）；但数据不完整时仍显式标注，不假装完整。
+     */
     marketAnomalyReport(a: MarketAnomalyRow, opts: { movers?: { wallet: string; buy: string; sell: string; trades: number }[]; shadow?: boolean } = {}): { title: string; body: string } {
         const market = this.repos.market(a.condition_id);
-        const question = market?.question ?? `condition ${a.condition_id.slice(0, 12)}…`;
+        const question = String(market?.question ?? `condition ${a.condition_id.slice(0, 12)}…`);
         const url = this.marketUrl(market);
         const label = Reports.ANOMALY_LABEL[a.kind] ?? a.kind;
+        const delta = a.delta === null || a.delta === undefined ? null : Number(a.delta);
         const lines: string[] = [];
-        lines.push(`<b>【市场异动】${escapeHtml(label)}</b>${opts.shadow ? '  <i>[影子模式]</i>' : ''}`);
-        lines.push('');
-        lines.push(`市场：${url ? this.link(String(question).slice(0, 60), url) : escapeHtml(String(question))}`);
-        if (a.outcome) lines.push(`结果：${escapeHtml(a.outcome)}`);
-        lines.push(`触发原因：${escapeHtml(a.reason)}`);
-        if (a.kind === 'price_move' && a.price_before && a.price_after) {
-            const d = Number(a.delta ?? 0);
-            lines.push(`现价：${fmtQty(a.price_after)}（${a.window_minutes} 分钟 ${fmtQty(a.price_before)} → ${fmtQty(a.price_after)}，${(d * 100).toFixed(1)} 个百分点）`);
+
+        lines.push(`<b>${Reports.kindEmoji(a.kind, delta)} ${escapeHtml(label)}</b>${opts.shadow ? '  <i>[影子模式]</i>' : ''}`);
+        lines.push(`🏷 ${url ? this.link(question.slice(0, 60), url) : escapeHtml(question)}`);
+
+        if (a.price_after) {
+            const tail = a.kind === 'price_move' && a.price_before
+                ? ` ${Reports.arrow(delta)} ${Reports.signedPctPoints(delta ?? 0)}（${a.window_minutes} 分钟 ${fmtQty(a.price_before)} → ${fmtQty(a.price_after)}）`
+                : (a.outcome ? `（结果 ${escapeHtml(a.outcome)}）` : '');
+            lines.push(`💰 现价 <b>${fmtQty(a.price_after)}</b>${tail}`);
+        } else if (a.outcome) {
+            lines.push(`🎯 结果 ${escapeHtml(a.outcome)}`);
         }
+
         let book = '未取到';
         if (a.best_bid && a.best_ask) {
             const inverted = Number(a.best_bid) > Number(a.best_ask);
             book = `买 ${fmtQty(a.best_bid)} / 卖 ${fmtQty(a.best_ask)}`
                 + (a.spread ? `（价差 ${fmtQty(a.spread)}）` : inverted ? '（买一高于卖一：瞬时错位，价差按未知处理）' : '（价差未取到）');
         }
-        lines.push(`盘口：${book}`);
-        const parts: string[] = [`24h 成交 ${fmtCompactUsd(a.volume_24h)}`, `流动性 ${fmtCompactUsd(a.liquidity)}`];
-        const c1 = Reports.ratioToPct(a.change_1h), c24 = Reports.ratioToPct(a.change_24h);
-        if (c1 || c24) parts.push(`变化 1h ${c1 ?? '未知'}｜24h ${c24 ?? '未知'}`);
-        if (market?.end_date) parts.push(`结束 ${String(market.end_date).slice(0, 10)}`);
-        lines.push(parts.join('｜'));
+        lines.push(`📕 盘口 ${book}${a.kind === 'spread_widen' ? ' 🟡 走阔' : ''}`);
+
+        if (a.kind !== 'price_move') lines.push(`⚡ ${escapeHtml(a.reason)}`);
+
+        const bg: string[] = [`24h 成交 ${fmtCompactUsd(a.volume_24h)}`, `流动性 ${fmtCompactUsd(a.liquidity)}`];
+        const c1 = Reports.ratioToPct(a.change_1h);
+        const c1n = a.change_1h === null || a.change_1h === undefined ? null : Number(a.change_1h);
+        const c24 = Reports.ratioToPct(a.change_24h);
+        const c24n = a.change_24h === null || a.change_24h === undefined ? null : Number(a.change_24h);
+        if (c1 || c24) bg.push(`1h ${c1 ?? '未知'}${Reports.ratioEmoji(c1n)}｜24h ${c24 ?? '未知'}${Reports.ratioEmoji(c24n)}`);
+        if (market?.end_date) bg.push(`结束 ${String(market.end_date).slice(0, 10)}`);
+        lines.push(`📊 ${bg.join('｜')}`);
         lines.push('');
+
         if (opts.movers?.length) {
-            lines.push(`<b>谁在动</b>（口径：最近已获取的成交流水，非全市场）`);
-            for (const m of opts.movers) {
-                const buy = fmtUsd(m.buy), sell = fmtUsd(m.sell);
-                const dust = Number(m.buy) + Number(m.sell) < 1 ? '（灰尘级，<$1）' : '';
-                lines.push(`• ${this.link(m.wallet.slice(0, 10) + '…', `https://polymarket.com/profile/${m.wallet}`)} 买 ${buy} / 卖 ${sell}（${m.trades} 笔）${dust}`);
-            }
+            lines.push('👀 <b>谁在动</b>（该市场最近已获取的成交，非全市场）');
+            for (const m of opts.movers) for (const l of this.walletMoverLines(m)) lines.push(l);
         } else {
-            lines.push('谁在动：暂无可用的成交流水（未取到该市场成交，是缺口不是「没人交易」）');
+            lines.push('👀 谁在动：未取到该市场的成交流水（这是缺口，不是「没人交易」）');
         }
         lines.push('');
-        lines.push(`<b>证据</b>：事件时间 ${escapeHtml(toDisplay(a.event_at))}｜观察时间 ${escapeHtml(toDisplay(a.observed_at))}｜窗口 ${a.window_minutes} 分钟｜规则 ${escapeHtml(a.rule_version)}`);
-        lines.push(`数据完整度：${qualityLabel(a.data_quality)}（异动判定基于本机观察到的窗口变化；1h/24h 变化来自来源口径，仅作背景）`);
-        if (url) lines.push(this.link('Polymarket 市场页', url));
-        else lines.push('市场页链接未取到（缺 slug；不伪造链接）');
-        return { title: `${label} · ${String(question).slice(0, 40)}`, body: lines.join('\n') };
+
+        if (url) lines.push(this.link('打开 Polymarket 市场页', url));
+        else lines.push('🔗 市场页链接未取到（缺 slug，不伪造链接）');
+        if (a.data_quality !== 'verified') lines.push(`⚠️ 数据完整度：${qualityLabel(a.data_quality)}`);
+        return { title: `${label} · ${question.slice(0, 40)}`, body: lines.join('\n') };
     }
 
     /** 市场异动的摘要一行（当日汇总用） */
@@ -454,7 +516,8 @@ export class Reports {
     static ratioToPct(v: string | null | undefined): string | null {
         if (v === null || v === undefined || v === '') return null;
         const n = Number(v);
-        return Number.isFinite(n) ? `${(n * 100).toFixed(1)}%` : null;
+        if (!Number.isFinite(n)) return null;
+        return `${n > 0 ? '+' : ''}${(n * 100).toFixed(1)}%`;
     }
     static fmtPct(v: number | null): string { return v === null ? '未知' : `${(v * 100).toFixed(1)}%`; }
     static fmtDec(v: ReturnType<typeof parseDec>): string { return decToString(v) ?? '未知'; }
