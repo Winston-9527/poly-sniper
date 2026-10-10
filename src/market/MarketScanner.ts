@@ -178,16 +178,21 @@ export class MarketScanner {
      * 扫描活跃市场：一次 gamma 调用拿到整页市场的价格与盘口，落成观察记录。
      * 同时把市场元数据（含 slug，用于链接）登记进 markets 表。
      */
-    async scan(opts: { pages?: number; pageSize?: number } = {}): Promise<{ observed: number; markets: number; stoppedBecause: string; warnings: string[]; snapshots: MarketSnapshot[] }> {
-        const pages = opts.pages ?? 3;
-        const pageSize = opts.pageSize ?? 500;
+    async scan(opts: { pages?: number; pageSize?: number } = {}): Promise<{ observed: number; markets: number; excluded: Record<string, number>; stoppedBecause: string; warnings: string[]; snapshots: MarketSnapshot[] }> {
+        const pages = opts.pages ?? 5;
+        const pageSize = opts.pageSize ?? 100;   // gamma 单次最多回 100 条：pageSize 必须等于真实页大小，否则第一页就误判“已到末页”
+        const cfg = this.deps.config;
+        const orders = (cfg.rules.marketScanOrders && cfg.rules.marketScanOrders.length ? cfg.rules.marketScanOrders : ['volume24hr']);
         const warnings: string[] = [];
         let observed = 0, markets = 0;
+        const excluded: Record<string, number> = {};
+        const seen = new Set<string>();
         const snapshots: MarketSnapshot[] = [];
         let stopped = 'end';
+        for (const order of orders) {
         for (let p = 0; p < pages; p++) {
             if (!this.deps.budget.trySpend('gamma/markets')) { stopped = 'budget'; warnings.push('本轮请求预算用尽，市场扫描未完成'); break; }
-            const r = await this.deps.dataApi.getMarkets(`limit=${pageSize}&offset=${p * pageSize}&active=true&closed=false&order=volume24hr&ascending=false`);
+            const r = await this.deps.dataApi.getMarkets(`limit=${pageSize}&offset=${p * pageSize}&active=true&closed=false&order=${order}&ascending=false`);
             if (!r.ok) {
                 this.repos.addGap('source', 'gamma/markets', r.kind === 'contract' ? 'contract_mismatch' : 'query_failed', `市场扫描失败：${r.error}`);
                 warnings.push(`市场扫描失败：${r.error}`);
@@ -197,6 +202,11 @@ export class MarketScanner {
             const observedAt = nowIso();
             this.repos.db.tx(() => {
                 for (const m of r.data) {
+                    if (seen.has(m.conditionId)) continue;
+                    seen.add(m.conditionId);
+                    // 长尾聚焦：排除高频结算（小时/日频币价盘、当天球赛）与体育/电竞联赛盘
+                    const why = this.exclusionReason(m);
+                    if (why) { excluded[why] = (excluded[why] ?? 0) + 1; continue; }
                     this.repos.upsertMarket({
                         conditionId: m.conditionId, slug: m.slug, question: m.question,
                         negRisk: m.negRisk, closed: m.closed, endDate: m.endDate,
@@ -226,9 +236,10 @@ export class MarketScanner {
                 }
             });
             if (r.data.length < pageSize) break;
-            if (p === pages - 1) { stopped = 'max_pages'; warnings.push(`市场扫描达到页数上限（${pages} 页），更靠后的市场未纳入`); }
+            if (p === pages - 1) { stopped = 'max_pages'; warnings.push(`市场扫描（${order}）达到页数上限（${pages} 页），更靠后的市场未纳入`); }
         }
-        return { observed, markets, stoppedBecause: stopped, warnings, snapshots };
+        }
+        return { observed, markets, excluded, stoppedBecause: stopped, warnings, snapshots };
     }
 
     /** 取某 token 的上一条观察（异动判定的基准） */
@@ -335,6 +346,33 @@ export class MarketScanner {
             const arr = Array.isArray(parsed.movers) ? parsed.movers as { wallet: string; buy: string; sell: string; trades: number }[] : [];
             return arr.slice(0, limit);
         } catch { return []; }
+    }
+
+    /**
+     * 排除判定：返回排除原因（null = 保留）。
+     * 目标=长尾市场机会，所以排掉高频结算与体育/电竞盘：
+     *   1) 距结束不足 minHoursToEnd（小时级币价盘、当天球赛）
+     *   2) slug 首段命中联赛表（nba/epl/atp/cs2…）
+     *   3) slug 命中高频模式正则（updown/hourly/15m/1h）
+     */
+    exclusionReason(m: GammaMarket): string | null {
+        const r = this.deps.config.rules;
+        const slug = String(m.slug ?? '').toLowerCase();
+        if (!slug) return 'no_slug';
+        const prefixes = r.marketExcludePrefixes ?? [];
+        const head = slug.split('-')[0];
+        if (prefixes.includes(head)) return `sports_esports_slug:${head}`;
+        const re = r.marketExcludeSlugRegex;
+        if (re && new RegExp(re, 'i').test(slug)) return 'high_frequency_slug';
+        const minH = r.marketMinHoursToEnd ?? 0;
+        if (minH > 0 && m.endDate) {
+            const end = Date.parse(String(m.endDate));
+            if (Number.isFinite(end)) {
+                const hours = (end - Date.now()) / 3600_000;
+                if (hours < minH) return hours < 0 ? 'already_ended' : `settles_soon:${hours.toFixed(1)}h`;
+            }
+        }
+        return null;
     }
 
     /** 把成交流水聚合成「谁在动」（金额用精确十进制相乘，不做二进制浮点累加） */

@@ -42,6 +42,8 @@ async function main() {
         const scan = await app.scanner.scan({ pages });
         snapshots = scan.snapshots;
         console.log(`扫描：${scan.markets} 个市场 / ${scan.observed} 个 token（停止原因 ${scan.stoppedBecause}）；请求预算剩余 ${app.budget.remaining}`);
+        const ex = Object.entries(scan.excluded).sort((a, b) => b[1] - a[1]);
+        if (ex.length) console.log(`已排除（长尾聚焦）：${ex.map(([k, v]) => `${k}=${v}`).join('，')}`);
         for (const w of scan.warnings) console.log(`警告：${w}`);
     }
 

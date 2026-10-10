@@ -22,8 +22,15 @@ function envBool(key: string, def: boolean): boolean {
     const v = envStr(key, def ? '1' : '0').toLowerCase();
     return v === '1' || v === 'true' || v === 'yes';
 }
-function envList(key: string): string[] {
-    return envStr(key, '').split(',').map((s) => s.trim()).filter(Boolean);
+function envList(key: string, fallback: string[] = []): string[] {
+    const raw = envStr(key, '');
+    if (!raw.trim()) return fallback;
+    return raw.split(',').map((s) => s.trim()).filter(Boolean);
+}
+/** 0 或负数 = 不限量（观察期用） */
+function envLimit(key: string, fallback: number): number {
+    const v = Number(envStr(key, String(fallback)));
+    return Number.isFinite(v) ? v : fallback;
 }
 
 export const RULES_VERSION = 'p1-rules-2';
@@ -102,14 +109,30 @@ export interface Config {
         /** 最低 24h 成交量 / 流动性（过滤死市场） */
         marketMinVolume24h: number;
         marketMinLiquidity: number;
-        /** 每轮扫描多少页活跃市场（每页 500 个市场） */
+        /** 每轮扫描多少页活跃市场（gamma 单页上限 100 条） */
         marketScanPages: number;
+        /** 扫描排序（逗号分隔）：volume24hr 抓活跃，liquidity 抓长尾深盘 */
+        marketScanOrders: string[];
+        /** 距结束不足这么多小时的市场直接排除（0=不排除）：小时级币价盘、当天球赛 */
+        marketMinHoursToEnd: number;
+        /** 排除的 slug 首段（体育/电竞联赛）：如 nba,epl,atp,cs2 */
+        marketExcludePrefixes: string[];
+        /** 排除的 slug 正则（高频结算模式） */
+        marketExcludeSlugRegex: string;
         /** 每轮最多为几个异动市场补成交流水（用于「谁在动」，1 请求/市场） */
         marketMoverPullsPerCycle: number;
         /** 每轮最多为几个异动 token 补精确盘口（CLOB，2 请求/token） */
         marketBookEnrichPerCycle: number;
+        /** 每个 token 保留多少条历史观察（只用于「和上一条比」，多了纯占盘） */
+        marketObsKeepPerToken: number;
     };
-    push: { maxPerMinute: number; maxPerDay: number; maxHighPerDay: number; maxPerCycleAlerts: number; maxMarketPerCycle: number; maxAttempts: number; retryBackoffSeconds: number[] };
+    push: {
+        /** 0 或负数 = 不限量；仅在观察期这样用，正常上线要设回上限 */
+        maxPerMinute: number; maxPerDay: number; maxHighPerDay: number; maxPerCycleAlerts: number; maxMarketPerCycle: number;
+        /** 两条消息之间的最小间隔（毫秒）：不限量时避免触发 Telegram 限流 */
+        minIntervalMs: number;
+        maxAttempts: number; retryBackoffSeconds: number[];
+    };
     /** 历史补全：只有在实现了可核验的补充来源后才打开 */
     backfill: { enabled: boolean };
     logLevel: 'debug' | 'info' | 'warn' | 'error';
@@ -170,20 +193,26 @@ export function loadConfig(): Config {
             marketVolumeSurgeHigh: envNum('MARKET_VOLUME_SURGE_HIGH', 8),
             marketMinVolume24h: envNum('MARKET_MIN_VOLUME_24H', 5000),
             marketMinLiquidity: envNum('MARKET_MIN_LIQUIDITY', 5000),
-            marketScanPages: envNum('MARKET_SCAN_PAGES', 3),
+            marketScanPages: envNum('MARKET_SCAN_PAGES', 5),
+            marketScanOrders: envList('MARKET_SCAN_ORDERS', ['volume24hr', 'liquidity']),
+            marketMinHoursToEnd: envNum('MARKET_MIN_HOURS_TO_END', 24),
+            marketExcludePrefixes: envList('MARKET_EXCLUDE_PREFIXES', ['nba', 'nfl', 'mlb', 'nhl', 'ncaa', 'cbb', 'cfb', 'wnba', 'ufc', 'box', 'f1', 'atp', 'wta', 'epl', 'efl', 'elc', 'ucl', 'uel', 'bun', 'serie', 'ligue', 'laliga', 'mls', 'tur', 'kbo', 'npb', 'ipl', 'cric', 'cs2', 'val', 'lol', 'dota2', 'rl', 'cod', 'soccer', 'tennis', 'basketball']),
+            marketExcludeSlugRegex: process.env.MARKET_EXCLUDE_SLUG_REGEX ?? '(updown|up-or-down|hourly|-(1h|5m|15m|30m|1m)-)',
             marketMoverPullsPerCycle: envNum('MARKET_MOVER_PULLS_PER_CYCLE', 4),
             marketBookEnrichPerCycle: envNum('MARKET_BOOK_ENRICH_PER_CYCLE', 6),
+            marketObsKeepPerToken: envNum('MARKET_OBS_KEEP_PER_TOKEN', 6),
         },
         push: {
-            maxPerMinute: envNum('MAX_ALERTS_PER_MIN', 6),
+            maxPerMinute: envLimit('MAX_ALERTS_PER_MIN', 6),
             // 日上限是防刷屏的硬闸：超过后不再即时推送，全部并入当日摘要，次日只发一条汇总
-            maxPerDay: envNum('MAX_ALERTS_PER_DAY', 24),
+            maxPerDay: envLimit('MAX_ALERTS_PER_DAY', 24),
             // 高优先级独立预算：high 不被普通日上限挤掉，但仍有自己的硬顶（默认 20 条/天）
-            maxHighPerDay: envNum('MAX_HIGH_PER_DAY', 20),
+            maxHighPerDay: envLimit('MAX_HIGH_PER_DAY', 20),
             // 每轮最多入队几条（优先高优先级），其余事件照常记录但不推送
-            maxPerCycleAlerts: envNum('MAX_ALERTS_PER_CYCLE', 4),
+            maxPerCycleAlerts: envLimit('MAX_ALERTS_PER_CYCLE', 4),
             // 每轮最多入队几条市场异动（首要信号，独立于钱包事件上限）
-            maxMarketPerCycle: envNum('MAX_MARKET_ALERTS_PER_CYCLE', 6),
+            maxMarketPerCycle: envLimit('MAX_MARKET_ALERTS_PER_CYCLE', 6),
+            minIntervalMs: envNum('PUSH_MIN_INTERVAL_MS', 1100),
             maxAttempts: envNum('PUSH_MAX_ATTEMPTS', 5),
             retryBackoffSeconds: [30, 120, 600, 1800, 7200],
         },

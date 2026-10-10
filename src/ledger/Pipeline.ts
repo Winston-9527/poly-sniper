@@ -31,7 +31,7 @@ export interface CycleReport {
     startedAt: string;
     finishedAt: string;
     /** 市场扫描（首要信号） */
-    marketScan: { observed: number; markets: number; stoppedBecause: string } | null;
+    marketScan: { observed: number; markets: number; stoppedBecause: string; excluded: Record<string, number> } | null;
     marketAnomalies: { created: number; enqueued: number; byKind: Record<string, number> };
     markets: string[];
     discovered: { market: string; added: number; skippedOverBudget: number; byEntry: Record<string, number> }[];
@@ -269,7 +269,7 @@ export class LedgerPipeline {
             for (const cid of cids) {
                 try { await this.deps.collector.ensureMarketMeta(cid); } catch { /* 报告里会写明市场信息缺失 */ }
             }
-            if (this.cycleEnqueued >= this.deps.config.push.maxPerCycleAlerts) {
+            if (this.deps.config.push.maxPerCycleAlerts > 0 && this.cycleEnqueued >= this.deps.config.push.maxPerCycleAlerts) {
                 alertsSuppressed += pushRows.length;
             } else {
                 const rep = this.reports.walletCycleReport(pushRows, { shadow: this.deps.config.shadowMode });
@@ -356,11 +356,25 @@ export class LedgerPipeline {
      * 市场扫描 + 异动判定 + 入队（首要信号）。
      * 价格异动优先入队；被判为异动的 token 再用 CLOB 补精确盘口（少量请求）。
      */
-    private async runMarketScan(): Promise<{ scan: { observed: number; markets: number; stoppedBecause: string } | null; anomalies: { created: number; enqueued: number; byKind: Record<string, number> } }> {
+    private async runMarketScan(): Promise<{ scan: { observed: number; markets: number; stoppedBecause: string; excluded: Record<string, number> } | null; anomalies: { created: number; enqueued: number; byKind: Record<string, number> } }> {
         const cfg = this.deps.config;
         const result = { created: 0, enqueued: 0, byKind: {} as Record<string, number> };
         if (!this.deps.scanner) return { scan: null, anomalies: result };
         const scan = await this.deps.scanner.scan({ pages: cfg.rules.marketScanPages });
+        // 观察表每个 token 每轮一行：1160 token × 288 轮/天 = 33 万行/天，必须裁剪。
+        // 只保留每个 token 最近 N 条（判定只需要「上一条」），每 6 轮裁一次。
+        if (this.cycles % 6 === 0) {
+            const keep = Math.max(2, cfg.rules.marketObsKeepPerToken ?? 6);
+            const n = this.repos.db.run(
+                `DELETE FROM market_observations WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (PARTITION BY token_id ORDER BY observed_at DESC, id DESC) rn
+                        FROM market_observations
+                    ) WHERE rn > ?
+                )`, keep,
+            );
+            if ((n.changes ?? 0) > 0) this.deps.log(`[market] 观察表裁剪：删除 ${n.changes} 条较早的观察（每 token 保留 ${keep} 条）`);
+        }
         const rules: AnomalyRules = anomalyRulesFromConfig(cfg);
 
         // 先把所有候选收集起来，再按「优先级 → 24h 量」排序处理：
@@ -407,7 +421,7 @@ export class LedgerPipeline {
             if (rec.inserted) result.created++;
             const row = this.repos.db.get<MarketAnomalyRow & Record<string, unknown>>('SELECT * FROM market_anomalies WHERE id=?', rec.id);
             if (!row) continue;
-            if (this.cycleMarketEnqueued >= cfg.push.maxMarketPerCycle) continue;
+            if (cfg.push.maxMarketPerCycle > 0 && this.cycleMarketEnqueued >= cfg.push.maxMarketPerCycle) continue;
             // ---- 谁在动：只给「真要入队」的异动补成交流水（预算花在用户看得见的那几条上）----
             if (moverPulls < cfg.rules.marketMoverPullsPerCycle) {
                 const mv = await this.deps.scanner.ensureTradesFor(cand.conditionId);
@@ -421,7 +435,7 @@ export class LedgerPipeline {
             });
             if (enq.inserted) { result.enqueued++; this.cycleMarketEnqueued++; }
         }
-        return { scan: { observed: scan.observed, markets: scan.markets, stoppedBecause: scan.stoppedBecause }, anomalies: result };
+        return { scan: { observed: scan.observed, markets: scan.markets, stoppedBecause: scan.stoppedBecause, excluded: scan.excluded }, anomalies: result };
     }
 
     stats(): { cycles: number; lastCycleAt: string | null } { return { cycles: this.cycles, lastCycleAt: this.lastCycleAt }; }

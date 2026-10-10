@@ -223,3 +223,36 @@ test('配置默认值可用（异动阈值来自配置，可调）', () => {
     assert.ok(r.minVolume24h > 0);
     app.close();
 });
+
+test('长尾聚焦：排除高频结算（小时级币价盘/当天球赛）与体育/电竞盘，保留长尾市场', () => {
+    const app = mkApp();
+    const sc = app.scanner;
+    const iso = (h) => new Date(Date.now() + h * 3600_000).toISOString();
+    // 体育/电竞：slug 首段命中联赛表（即使几个月后才结算也排除）
+    assert.match(String(sc.exclusionReason({ slug: 'epl-ars-lee-2026-10-10-ars', endDate: iso(200) })), /sports_esports_slug:epl/);
+    assert.match(String(sc.exclusionReason({ slug: 'cs2-navi-vs-faze-bo3', endDate: iso(100) })), /sports_esports_slug:cs2/);
+    assert.match(String(sc.exclusionReason({ slug: 'nba-lal-bos-2026-12-25', endDate: iso(1000) })), /sports_esports_slug:nba/);
+    // 高频模式：updown/hourly/15m/1h（结束时间再远也排除）
+    assert.equal(sc.exclusionReason({ slug: 'bitcoin-updown-15m-2026-10-10-1500', endDate: iso(300) }), 'high_frequency_slug');
+    assert.equal(sc.exclusionReason({ slug: 'eth-hourly-price-2026-11-01', endDate: iso(400) }), 'high_frequency_slug');
+    // 距结束不足 24h：小时级币价盘、当天球赛（非联赛 slug 也能挡住）
+    assert.match(String(sc.exclusionReason({ slug: 'will-it-rain-in-nyc-today', endDate: iso(3) })), /settles_soon/);
+    assert.equal(sc.exclusionReason({ slug: 'some-stale-market', endDate: iso(-5) }), 'already_ended');
+    // 长尾保留
+    assert.equal(sc.exclusionReason({ slug: 'will-nithya-raman-win-the-2026-los-angeles-mayoral-election', endDate: iso(500) }), null);
+    assert.equal(sc.exclusionReason({ slug: 'strait-of-hormuz-closed-by-december-31-2026', endDate: iso(1200) }), null);
+    app.close();
+});
+
+test('观察期不限量：上限设 0 时 25 条全部照发，不再合并成摘要', async () => {
+    const app = mkApp({ config: { push: { maxPerMinute: 0, maxPerDay: 0, maxHighPerDay: 0, maxPerCycleAlerts: 0, maxMarketPerCycle: 0, minIntervalMs: 0 } } });
+    seedMarket(app.repos);
+    for (let i = 0; i < 25; i++) {
+        app.outbox.enqueue(`alert:unlimited:${i}`, { chatId: '999', title: `告警${i}`, body: `b${i}`, wallet: '', conditionId: CID, priority: 'medium', dataQuality: 'verified' });
+    }
+    const rep = await app.outbox.flush(new Date());
+    assert.equal(rep.sent, 25, '25 条全部发出');
+    assert.equal(rep.merged ?? 0, 0, '没有条目被合并');
+    assert.equal(app.sentMessages.length, 25);
+    app.close();
+});

@@ -60,13 +60,16 @@ export class AlertOutbox {
         const report: FlushReport = { sent: 0, failed: 0, retried: 0, dead: 0, merged: 0, deferredByRateLimit: 0, details: [] };
         const nowIsoStr = now.toISOString();
         const since = new Date(now.getTime() - 60_000).toISOString();
-        let budget = Math.max(0, this.config.push.maxPerMinute - this.repos.sentSince(since));
+        // 0/负数 = 不限量（观察期）：用 Infinity 表达，避免出现“上限 0 条”这种误读
+        const unlimited = (v: number) => !(v > 0);
+        let budget = unlimited(this.config.push.maxPerMinute) ? Number.POSITIVE_INFINITY : Math.max(0, this.config.push.maxPerMinute - this.repos.sentSince(since));
         // 日上限：超过后不再即时推送，全部并入「当日摘要」，次日只发一条汇总
         const dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
-        let dayBudget = Math.max(0, this.config.push.maxPerDay - this.repos.sentSince(dayStart));
-        let highBudget = Math.max(0, (this.config.push.maxHighPerDay ?? 0) - this.repos.sentHighSince(dayStart));
+        let dayBudget = unlimited(this.config.push.maxPerDay) ? Number.POSITIVE_INFINITY : Math.max(0, this.config.push.maxPerDay - this.repos.sentSince(dayStart));
+        let highBudget = unlimited(this.config.push.maxHighPerDay) ? Number.POSITIVE_INFINITY : Math.max(0, this.config.push.maxHighPerDay - this.repos.sentHighSince(dayStart));
 
-        const due = this.repos.dueAlerts(nowIsoStr, this.config.push.maxPerMinute * 10);
+        const due = this.repos.dueAlerts(nowIsoStr, unlimited(this.config.push.maxPerMinute) ? 500 : this.config.push.maxPerMinute * 10);
+        let attempted = 0;
         for (const row of due) {
             const id = Number(row.id);
             let payload: AlertPayload;
@@ -89,6 +92,11 @@ export class AlertOutbox {
                 payload.title = this.digestTitle(id) ?? payload.title;
             }
             if (!this.repos.claimAlert(id, nowIsoStr)) continue;
+            // 不限量时会一次发很多条：用最小间隔（默认 1.1s）避免 Telegram 限流，这不是产品上限
+            if (attempted > 0 && this.config.push.minIntervalMs > 0) {
+                await new Promise((r) => setTimeout(r, this.config.push.minIntervalMs));
+            }
+            attempted++;
             const res = await this.sender(payload.chatId, payload.body);
             if (res.ok) {
                 this.repos.markAlertSent(id, res.messageId ?? null, nowIsoStr);
