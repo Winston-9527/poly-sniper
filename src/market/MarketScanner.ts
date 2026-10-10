@@ -362,6 +362,11 @@ export class MarketScanner {
         const prefixes = r.marketExcludePrefixes ?? [];
         const head = slug.split('-')[0];
         if (prefixes.includes(head)) return `sports_esports_slug:${head}`;
+        for (const kw of r.marketExcludeKeywords ?? []) {
+            if (!kw) continue;
+            // slug 用 - 分词：按「词边界」匹配，避免 nba 命中无关词
+            if (new RegExp(`(^|-)${kw.replace(/[-]/g, '\\-')}(-|$)`).test(slug)) return `sports_esports_keyword:${kw}`;
+        }
         const re = r.marketExcludeSlugRegex;
         if (re && new RegExp(re, 'i').test(slug)) return 'high_frequency_slug';
         const minH = r.marketMinHoursToEnd ?? 0;

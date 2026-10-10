@@ -256,3 +256,16 @@ test('观察期不限量：上限设 0 时 25 条全部照发，不再合并成�
     assert.equal(app.sentMessages.length, 25);
     app.close();
 });
+
+test('长尾聚焦：slug 里含联赛/赛事名（首段是 will 的）也要排除，如 ESL 电竞、Wimbledon', () => {
+    const app = mkApp();
+    const sc = app.scanner;
+    const iso = (h) => new Date(Date.now() + h * 3600_000).toISOString();
+    assert.match(String(sc.exclusionReason({ slug: 'will-vitality-win-the-esl-pro-league-season-24', endDate: iso(2000) })), /sports_esports_keyword:esl/);
+    assert.match(String(sc.exclusionReason({ slug: 'will-novak-djokovic-win-wimbledon-2027', endDate: iso(5000) })), /sports_esports_keyword:wimbledon/);
+    assert.match(String(sc.exclusionReason({ slug: 'will-real-madrid-win-la-liga-2027', endDate: iso(3000) })), /sports_esports_keyword:la-liga/);
+    // 不该误伤的：含相似片段的非体育市场
+    assert.equal(sc.exclusionReason({ slug: 'will-openai-release-gpt-6-by-december-2026', endDate: iso(1500) }), null);
+    assert.equal(sc.exclusionReason({ slug: 'will-the-us-enter-a-recession-in-2027', endDate: iso(2000) }), null);
+    app.close();
+});

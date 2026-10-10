@@ -119,6 +119,8 @@ export interface Config {
         marketExcludePrefixes: string[];
         /** 排除的 slug 正则（高频结算模式） */
         marketExcludeSlugRegex: string;
+        /** 排除的 slug 关键词（任意位置命中）：联赛/赛事名，如 esl、premier-league、wimbledon */
+        marketExcludeKeywords: string[];
         /** 每轮最多为几个异动市场补成交流水（用于「谁在动」，1 请求/市场） */
         marketMoverPullsPerCycle: number;
         /** 每轮最多为几个异动 token 补精确盘口（CLOB，2 请求/token） */
@@ -198,6 +200,17 @@ export function loadConfig(): Config {
             marketMinHoursToEnd: envNum('MARKET_MIN_HOURS_TO_END', 24),
             marketExcludePrefixes: envList('MARKET_EXCLUDE_PREFIXES', ['nba', 'nfl', 'mlb', 'nhl', 'ncaa', 'cbb', 'cfb', 'wnba', 'ufc', 'box', 'f1', 'atp', 'wta', 'epl', 'efl', 'elc', 'ucl', 'uel', 'bun', 'serie', 'ligue', 'laliga', 'mls', 'tur', 'kbo', 'npb', 'ipl', 'cric', 'cs2', 'val', 'lol', 'dota2', 'rl', 'cod', 'soccer', 'tennis', 'basketball']),
             marketExcludeSlugRegex: process.env.MARKET_EXCLUDE_SLUG_REGEX ?? '(updown|up-or-down|hourly|-(1h|5m|15m|30m|1m)-)',
+            marketExcludeKeywords: envList('MARKET_EXCLUDE_KEYWORDS', [
+                // 电竞赛事（slug 常以 will 开头，首段规则抓不到）
+                'esl', 'blast', 'iem', 'pgl', 'esports', 'lck', 'lec', 'lpl', 'vct', 'valorant',
+                'counter-strike', 'cs2', 'csgo', 'dota', 'league-of-legends', 'overwatch', 'starcraft',
+                // 传统体育联盟/赛事
+                'premier-league', 'la-liga', 'serie-a', 'bundesliga', 'ligue-1', 'eredivisie', 'mls',
+                'uefa', 'champions-league', 'europa-league', 'copa', 'world-cup', 'super-bowl',
+                'world-series', 'stanley-cup', 'wimbledon', 'grand-slam', 'us-open', 'french-open',
+                'australian-open', 'olympics', 'ufc', 'boxing', 'formula-1', 'f1-',
+                'nba', 'nfl', 'mlb', 'nhl', 'wnba', 'ncaa', 'atp', 'wta', 'cricket', 'ipl',
+            ]),
             marketMoverPullsPerCycle: envNum('MARKET_MOVER_PULLS_PER_CYCLE', 4),
             marketBookEnrichPerCycle: envNum('MARKET_BOOK_ENRICH_PER_CYCLE', 6),
             marketObsKeepPerToken: envNum('MARKET_OBS_KEEP_PER_TOKEN', 6),
