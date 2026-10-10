@@ -136,7 +136,9 @@ export class Reports {
         if (opts.movers?.length) {
             lines.push(`<b>谁在动</b>（口径：最近已获取的成交流水，非全市场）`);
             for (const m of opts.movers) {
-                lines.push(`• ${this.link(m.wallet.slice(0, 10) + '…', `https://polygonscan.com/address/${m.wallet}`)} 买 $${m.buy} / 卖 $${m.sell}（${m.trades} 笔）`);
+                const buy = fmtUsd(m.buy), sell = fmtUsd(m.sell);
+                const dust = Number(m.buy) + Number(m.sell) < 1 ? '（灰尘级，<$1）' : '';
+                lines.push(`• ${this.link(m.wallet.slice(0, 10) + '…', `https://polymarket.com/profile/${m.wallet}`)} 买 ${buy} / 卖 ${sell}（${m.trades} 笔）${dust}`);
             }
         } else {
             lines.push('谁在动：暂无可用的成交流水（未取到该市场成交，是缺口不是「没人交易」）');
@@ -201,7 +203,7 @@ export class Reports {
         lines.push('');
         // —— 背景 ——
         lines.push(`<b>背景</b>`);
-        lines.push(`钱包：${this.link(wallet.slice(0, 10) + '…' + wallet.slice(-6), `https://polygonscan.com/address/${wallet}`)}`);
+        lines.push(`钱包：${this.link(wallet.slice(0, 10) + '…' + wallet.slice(-6), `https://polymarket.com/profile/${wallet}`)}`);
         lines.push(this.profileLine(profile));
         const pos = this.positionLine(wallet);
         if (pos) lines.push(pos);
@@ -227,7 +229,7 @@ export class Reports {
         const mUrl = this.marketUrl(market);
         if (mUrl) lines.push(this.link(market?.slug ? 'Polymarket 市场页' : 'Polymarket 事件页', mUrl));
         else if (market) lines.push('市场页链接未取到（缺 slug；已尝试用活动里的 slug 补齐）');
-        lines.push(this.link('链上地址', `https://polygonscan.com/address/${wallet}`));
+        lines.push(this.link('链上地址', `https://polymarket.com/profile/${wallet}`));
         return { title: `${eventLabel(e.event_type)} · ${String(question).slice(0, 40)}`, body: lines.join('\n') };
     }
 
@@ -251,7 +253,7 @@ export class Reports {
         sorted.forEach((e, i) => lines.push(...this.eventCardLines(e, marks[i] ?? `(${i + 1})`)));
         lines.push('');
         lines.push('<b>背景</b>');
-        lines.push(`钱包：${this.link(wallet.slice(0, 10) + '…' + wallet.slice(-6), `https://polygonscan.com/address/${wallet}`)}`);
+        lines.push(`钱包：${this.link(wallet.slice(0, 10) + '…' + wallet.slice(-6), `https://polymarket.com/profile/${wallet}`)}`);
         const profile = this.profiler.build(wallet, { windowsDays: this.config.rules.baselineWindowsDays });
         lines.push(this.profileLine(profile));
         const pos = this.positionLine(wallet, 3);
@@ -289,7 +291,7 @@ export class Reports {
             const name = market?.question ? String(market.question).slice(0, 40) : (e.condition_id ? `condition ${e.condition_id.slice(0, 10)}…` : '市场未知');
             lines.push(url ? this.link(`市场页：${name}`, url) : `市场页未取到（${name}）`);
         }
-        lines.push(this.link('链上地址', `https://polygonscan.com/address/${wallet}`));
+        lines.push(this.link('链上地址', `https://polymarket.com/profile/${wallet}`));
         return { title: `钱包动态 · ${sorted.length} 个事件 · ${wallet.slice(0, 8)}…`, body: lines.join('\n'), digestLines };
     }
 
@@ -337,7 +339,7 @@ export class Reports {
         const w = address.toLowerCase();
         const profile = this.profiler.build(w, { windowsDays: opts.windowsDays ?? this.config.rules.baselineWindowsDays });
         const lines: string[] = [];
-        lines.push(`<b>钱包画像</b> ${this.link(w.slice(0, 10) + '…' + w.slice(-6), `https://polygonscan.com/address/${w}`)}`);
+        lines.push(`<b>钱包画像</b> ${this.link(w.slice(0, 10) + '…' + w.slice(-6), `https://polymarket.com/profile/${w}`)}`);
         lines.push('');
         lines.push(`<b>覆盖与活跃历史</b>`);
         lines.push(this.profiler.describeActivityHistory(profile));

@@ -121,7 +121,7 @@ test('市场异动报告必须带：市场名、结果、现价变化、盘口�
     assert.match(rep.body, /变化 1h -12\.0%｜24h -38\.0%/);
     assert.match(rep.body, /polymarket\.com\/market\/test-market/, '必须给出市场链接');
     assert.match(rep.body, /谁在动/);
-    assert.match(rep.body, /\$12000/);
+    assert.match(rep.body, /\$12,000/);
     assert.match(rep.body, /5 分钟/);
     // 没有 slug 时明确说「未取到」，不伪造链接
     const app2 = mkApp();
@@ -171,7 +171,7 @@ test('谁在动：补一次成交流水后，报告里能看到具体钱包与�
     const row = app.repos.db.get('SELECT * FROM market_anomalies WHERE id=?', rec.id);
     const body = new Reports(app.repos, app.cfg).marketAnomalyReport(row, { movers: app.scanner.recentMovers(CID, 3) }).body;
     assert.match(body, /0xaaaaaaaa…/);
-    assert.match(body, /买 \$6000 \/ 卖 \$0/);
+    assert.match(body, /买 \$6,000 \/ 卖 \$0/);
     app.close();
 });
 
@@ -267,5 +267,31 @@ test('长尾聚焦：slug 里含联赛/赛事名（首段是 will 的）也要�
     // 不该误伤的：含相似片段的非体育市场
     assert.equal(sc.exclusionReason({ slug: 'will-openai-release-gpt-6-by-december-2026', endDate: iso(1500) }), null);
     assert.equal(sc.exclusionReason({ slug: 'will-the-us-enter-a-recession-in-2027', endDate: iso(2000) }), null);
+    app.close();
+});
+
+test('链接与金额：钱包指向 Polymarket 持仓页（不是 Polygonscan），金额取整到分', () => {
+    const app = mkApp();
+    const W = '0x40e4d8ad998bea126b20f3534b540fbf34866ef7';
+    seedMarket(app.repos);
+    const rec = app.repos.insertMarketAnomaly({
+        dedupeKey: 'ma:link:1', conditionId: CID, tokenId: TOKEN, outcome: 'Yes', kind: 'price_move',
+        windowMinutes: 5, priceBefore: '0.30', priceAfter: '0.36', delta: '0.06',
+        bestBid: '0.35', bestAsk: '0.37', spread: '0.02', volume24h: '703311', liquidity: '77710',
+        change1h: null, change24h: null, priority: 'high', reason: 'r', dataQuality: 'verified',
+        ruleVersion: 'p1-rules-2', eventAt: '2026-10-09T10:05:00.000Z', observedAt: '2026-10-09T10:05:01.000Z',
+    });
+    const row = app.repos.db.get('SELECT * FROM market_anomalies WHERE id=?', rec.id);
+    const body = new Reports(app.repos, app.cfg).marketAnomalyReport(row, {
+        movers: [{ wallet: W, buy: '7.840000000860318', sell: '0', trades: 1 }],
+    }).body;
+    assert.match(body, /https:\/\/polymarket\.com\/profile\/0x40e4d8ad998bea126b20f3534b540fbf34866ef7/, '钱包链接指向 Polymarket 持仓页');
+    assert.equal(body.includes('polygonscan'), false, '不再出现 Polygonscan');
+    assert.match(body, /买 \$7\.84 \/ 卖 \$0/, '金额取整到分，不打印 18 位小数');
+    assert.equal(/灰尘级/.test(body), false, '$7.84 不算灰尘级');
+    const dustBody = new Reports(app.repos, app.cfg).marketAnomalyReport(row, {
+        movers: [{ wallet: W, buy: '0.42', sell: '0', trades: 1 }],
+    }).body;
+    assert.match(dustBody, /灰尘级/, '真正的灰尘级成交（<$1）有标注');
     app.close();
 });

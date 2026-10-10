@@ -49,7 +49,10 @@ test('市场维度：报告必须写出 24h 成交量/流动性/现价/市场页
     const rep2 = app.reports.behaviorReport(ev2, { shadow: true });
     assert.match(rep2.body, /市场标题未取到/, '缺标题必须显式声明，而不是静默省略');
     assert.match(rep2.body, /condition 0x9999999999…/, '缺标题时至少要能定位 conditionId');
-    assert.ok(!/polymarket\.com/.test(rep2.body.split('<b>证据</b>')[1] ?? ''), '缺 slug 时不伪造市场链接');
+    // 缺 slug 时不伪造「市场页」链接（钱包链接指向 Polymarket 持仓页，不算市场链接）
+    const evid = rep2.body.split('<b>证据</b>')[1] ?? '';
+    assert.ok(!/polymarket\.com\/(market|event)\//.test(evid), '缺 slug 时不伪造市场链接');
+    assert.match(evid, /polymarket\.com\/profile\//, '钱包链接应指向 Polymarket 持仓页（方便看仓位）');
     app.close();
 });
 
