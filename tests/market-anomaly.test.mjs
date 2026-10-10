@@ -139,6 +139,73 @@ test('市场异动报告必须带：市场名、结果、现价变化、盘口�
     app.close(); app2.close();
 });
 
+test('谁在动：补一次成交流水后，报告里能看到具体钱包与买卖金额；10 分钟内不重复拉取', async () => {
+    const trades = [
+        { proxyWallet: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', side: 'BUY', asset: TOKEN, conditionId: CID, size: 20000, price: 0.3, timestamp: Math.floor(Date.now() / 1000) - 300, transactionHash: '0xm1', outcome: 'Yes', outcomeIndex: 0 },
+        { proxyWallet: '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', side: 'SELL', asset: TOKEN, conditionId: CID, size: 5000, price: 0.3, timestamp: Math.floor(Date.now() / 1000) - 200, transactionHash: '0xm2', outcome: 'Yes', outcomeIndex: 0 },
+    ];
+    const app = mkApp({ dataApiSpec: { trades } });
+    seedMarket(app.repos);
+    const first = await app.scanner.ensureTradesFor(CID);
+    assert.equal(first.ok, true);
+    assert.equal(first.rows, 2, '取到 2 笔成交');
+    const movers = app.scanner.recentMovers(CID, 3);
+    assert.equal(movers.length, 2);
+    assert.equal(movers[0].wallet, '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    assert.equal(movers[0].buy, '6000', '20000 份 × 0.30 = $6000');
+    assert.equal(movers[1].sell, '1500');
+
+    // 10 分钟内不重复请求（省预算）
+    const second = await app.scanner.ensureTradesFor(CID);
+    assert.equal(second.skipped ? true : false, true);
+    assert.match(String(second.skipped), /已取过/);
+
+    // 报告里必须出现「谁在动」的具体条目
+    const rec = app.repos.insertMarketAnomaly({
+        dedupeKey: 'ma:movers:1', conditionId: CID, tokenId: TOKEN, outcome: 'Yes', kind: 'price_move',
+        windowMinutes: 5, priceBefore: '0.30', priceAfter: '0.36', delta: '0.06',
+        bestBid: '0.35', bestAsk: '0.37', spread: '0.02', volume24h: '703311', liquidity: '77710',
+        change1h: null, change24h: null, priority: 'high', reason: 'r', dataQuality: 'verified',
+        ruleVersion: 'p1-rules-2', eventAt: '2026-10-09T10:05:00.000Z', observedAt: '2026-10-09T10:05:01.000Z',
+    });
+    const row = app.repos.db.get('SELECT * FROM market_anomalies WHERE id=?', rec.id);
+    const body = new Reports(app.repos, app.cfg).marketAnomalyReport(row, { movers: app.scanner.recentMovers(CID, 3) }).body;
+    assert.match(body, /0xaaaaaaaa…/);
+    assert.match(body, /买 \$6000 \/ 卖 \$0/);
+    app.close();
+});
+
+test('盘口补充：CLOB 双边价自己算价差（第二结果也能补上，不再写「未取到」）', async () => {
+    const prices = { buy: '0.37', sell: '0.35' };
+    const fakeHttpResponse = (url) => {
+        if (url.includes('side=buy')) return { ok: true, data: { price: prices.buy }, status: 200, ms: 1, url };
+        if (url.includes('side=sell')) return { ok: true, data: { price: prices.sell }, status: 200, ms: 1, url };
+        return { ok: false, kind: 'http', error: '404', url, ms: 1 };
+    };
+    const app = mkApp({ httpHandler: async (url) => fakeHttpResponse(url) });
+    const book = await app.scanner.enrichBook(T_NO);
+    assert.equal(book.ok, true);
+    assert.equal(book.bestBid, '0.35');
+    assert.equal(book.bestAsk, '0.37');
+    assert.equal(book.spread, '0.02', '价差由买/卖自行相减（精确十进制）');
+    assert.equal(book.requests, 2, '只用 2 个请求');
+    app.close();
+});
+
+test('盘口走阔必须「变宽」：放大幅度不够即使很宽也不报（分币市场噪音闸）', () => {
+    const prev = snap({ bestBid: parseDec('0.04'), bestAsk: parseDec('0.06'), spread: parseDec('0.02') });
+    const wideButSame = snap({ bestBid: parseDec('0.20'), bestAsk: parseDec('0.40'), spread: parseDec('0.20'), observedAt: '2026-10-09T10:05:00.000Z' });
+    // 中间价 0.30 ≥ 0.08、绝对价差 0.20 ≥ 0.02、放大 10 倍 → 触发（这是真变宽）
+    assert.ok(detectAnomaly(prev, wideButSame, RULES).candidates.some((c) => c.kind === 'spread_widen'));
+
+    const pennyPrev = snap({ bestBid: parseDec('0.001'), bestAsk: parseDec('0.002'), spread: parseDec('0.001') });
+    const pennyCur = snap({ bestBid: parseDec('0.002'), bestAsk: parseDec('0.003'), spread: parseDec('0.001'), observedAt: '2026-10-09T10:05:00.000Z' });
+    assert.equal(detectAnomaly(pennyPrev, pennyCur, RULES).candidates.some((c) => c.kind === 'spread_widen'), false, '分币市场（中间价 <0.08）不报相对价差');
+
+    const tinyWiden = snap({ bestBid: parseDec('0.29'), bestAsk: parseDec('0.315'), spread: parseDec('0.025'), observedAt: '2026-10-09T10:05:00.000Z' });
+    assert.equal(detectAnomaly(snap(), tinyWiden, RULES).candidates.some((c) => c.kind === 'spread_widen'), false, '只放大 1.25 倍（<2）不报');
+});
+
 test('配置默认值可用（异动阈值来自配置，可调）', () => {
     const app = mkApp();
     const r = anomalyRulesFromConfig(app.cfg);

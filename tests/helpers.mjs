@@ -9,6 +9,7 @@ import { openDb } from '../dist/db/Database.js';
 import { Repos } from '../dist/db/repos.js';
 import { loadConfig } from '../dist/config.js';
 import { Collector } from '../dist/ledger/Collector.js';
+import { MarketScanner } from '../dist/market/MarketScanner.js';
 import { LedgerPipeline } from '../dist/ledger/Pipeline.js';
 import { AlertOutbox } from '../dist/alerts/Outbox.js';
 import { Reports } from '../dist/report/Reports.js';
@@ -105,8 +106,20 @@ export function fakeChain(spec = {}) {
 }
 function fail2(kind, error) { return { ok: false, kind, error, url: 'rpc://x', ms: 1 }; }
 
+/** 假 HTTP：默认让 CLOB 类请求失败（测试里按需覆盖） */
+export function fakeHttp(handler = null) {
+    return {
+        async getJson(url, source) {
+            if (handler) return handler(url, source);
+            return { ok: false, kind: 'network', error: '测试未提供 http', url, ms: 1 };
+        },
+        trySpend() { return true; },
+        proxyDispatcher: undefined,
+    };
+}
+
 /** 建一个离线 app（内存库 + 假来源） */
-export function mkApp({ config = {}, dataApiSpec = {}, chainSpec = {} } = {}) {
+export function mkApp({ config = {}, dataApiSpec = {}, chainSpec = {}, httpHandler = null } = {}) {
     const cfg = mkConfig(config);
     const db = openDb(cfg.dbPath);
     const repos = new Repos(db);
@@ -114,6 +127,8 @@ export function mkApp({ config = {}, dataApiSpec = {}, chainSpec = {} } = {}) {
     const dataApi = fakeDataApi(dataApiSpec);
     const chain = fakeChain(chainSpec);
     const collector = new Collector({ repos, dataApi, chain, config: cfg, budget, log: () => { } });
+    const http = fakeHttp(httpHandler);
+    const scanner = new MarketScanner({ repos, dataApi, http, config: cfg, budget, log: () => { } });
     const sentMessages = [];
     let senderMode = 'ok';
     const outbox = new AlertOutbox(repos, cfg, async (chatId, body) => {
@@ -123,7 +138,7 @@ export function mkApp({ config = {}, dataApiSpec = {}, chainSpec = {} } = {}) {
     }, () => { });
     const pipeline = new LedgerPipeline({ repos, collector, config: cfg, outbox, log: () => { } });
     const reports = new Reports(repos, cfg);
-    return { cfg, db, repos, budget, dataApi, chain, collector, outbox, pipeline, reports, sentMessages, setSenderMode: (m) => { senderMode = m; }, close: () => db.close() };
+    return { cfg, db, repos, budget, dataApi, chain, collector, scanner, http, outbox, pipeline, reports, sentMessages, setSenderMode: (m) => { senderMode = m; }, close: () => db.close() };
 }
 
 /** 直接把活动写进库（模拟采集结果），避免测试依赖网络 */

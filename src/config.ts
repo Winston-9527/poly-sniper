@@ -104,6 +104,10 @@ export interface Config {
         marketMinLiquidity: number;
         /** 每轮扫描多少页活跃市场（每页 500 个市场） */
         marketScanPages: number;
+        /** 每轮最多为几个异动市场补成交流水（用于「谁在动」，1 请求/市场） */
+        marketMoverPullsPerCycle: number;
+        /** 每轮最多为几个异动 token 补精确盘口（CLOB，2 请求/token） */
+        marketBookEnrichPerCycle: number;
     };
     push: { maxPerMinute: number; maxPerDay: number; maxHighPerDay: number; maxPerCycleAlerts: number; maxMarketPerCycle: number; maxAttempts: number; retryBackoffSeconds: number[] };
     /** 历史补全：只有在实现了可核验的补充来源后才打开 */
@@ -159,14 +163,16 @@ export function loadConfig(): Config {
             marketWindowMinutes: envNum('MARKET_WINDOW_MINUTES', 15),
             marketSpreadRatio: envNum('MARKET_SPREAD_RATIO', 0.10),
             marketSpreadRatioHigh: envNum('MARKET_SPREAD_RATIO_HIGH', 0.25),
-            marketSpreadGrowth: envNum('MARKET_SPREAD_GROWTH', 1.5),
-            marketMinMidPrice: envNum('MARKET_MIN_MID_PRICE', 0.05),
-            marketMinAbsSpread: envNum('MARKET_MIN_ABS_SPREAD', 0.01),
+            marketSpreadGrowth: envNum('MARKET_SPREAD_GROWTH', 2),
+            marketMinMidPrice: envNum('MARKET_MIN_MID_PRICE', 0.08),
+            marketMinAbsSpread: envNum('MARKET_MIN_ABS_SPREAD', 0.02),
             marketVolumeSurge: envNum('MARKET_VOLUME_SURGE', 3),
             marketVolumeSurgeHigh: envNum('MARKET_VOLUME_SURGE_HIGH', 8),
             marketMinVolume24h: envNum('MARKET_MIN_VOLUME_24H', 5000),
             marketMinLiquidity: envNum('MARKET_MIN_LIQUIDITY', 5000),
             marketScanPages: envNum('MARKET_SCAN_PAGES', 3),
+            marketMoverPullsPerCycle: envNum('MARKET_MOVER_PULLS_PER_CYCLE', 4),
+            marketBookEnrichPerCycle: envNum('MARKET_BOOK_ENRICH_PER_CYCLE', 6),
         },
         push: {
             maxPerMinute: envNum('MAX_ALERTS_PER_MIN', 6),

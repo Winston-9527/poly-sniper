@@ -10,8 +10,8 @@ import { Profiler } from './Profiler.js';
 import { AlertOutbox } from '../alerts/Outbox.js';
 import { Reports, BehaviorRow, MarketAnomalyRow } from '../report/Reports.js';
 import { buildBehavior, ChangeForBehavior, PriorityRules, isReactivation } from './Behaviors.js';
-import { MarketScanner, MarketSnapshot, AnomalyRules, detectAnomaly, anomalyRulesFromConfig } from '../market/MarketScanner.js';
-import { decToString, fromDb, parseDec, mul, div, decToNumber, Dec } from '../util/decimal.js';
+import { MarketScanner, MarketSnapshot, AnomalyCandidate, AnomalyRules, detectAnomaly, anomalyRulesFromConfig } from '../market/MarketScanner.js';
+import { decToString, fromDb, parseDec, mul, div, decToNumber, Dec, ZERO } from '../util/decimal.js';
 import { nowIso } from '../util/time.js';
 
 export interface ProcessResult {
@@ -362,36 +362,65 @@ export class LedgerPipeline {
         if (!this.deps.scanner) return { scan: null, anomalies: result };
         const scan = await this.deps.scanner.scan({ pages: cfg.rules.marketScanPages });
         const rules: AnomalyRules = anomalyRulesFromConfig(cfg);
-        const snapshots: MarketSnapshot[] = (scan as { snapshots?: MarketSnapshot[] }).snapshots ?? [];
-        let enriched = 0;
-        for (const cur of snapshots) {
+
+        // 先把所有候选收集起来，再按「优先级 → 24h 量」排序处理：
+        // 高优先级先占用盘口补充与成交流水的请求预算。
+        const pending: { cand: AnomalyCandidate; snap: MarketSnapshot }[] = [];
+        for (const cur of scan.snapshots) {
             if (!cur.tokenId || cur.price === null) continue;
             const prev = this.deps.scanner.previousSnapshot(cur.tokenId, cur.observedAt);
             const { candidates } = detectAnomaly(prev, cur, rules);
             for (const cand of candidates) {
-                if (cand.priority === 'low') { result.byKind[cand.kind] = (result.byKind[cand.kind] ?? 0); continue; }
-                // 高优先级价格异动：补精确盘口（每次最多 3 个 token，避免请求放大）
-                let snap = cur;
-                if (cand.priority === 'high' && enriched < 3) {
-                    enriched++;
-                    const book = await this.deps.scanner.enrichBook(cur.tokenId);
-                    if (book.ok) snap = { ...cur, bestBid: book.bestBid ? parseDec(book.bestBid) : cur.bestBid, bestAsk: book.bestAsk ? parseDec(book.bestAsk) : cur.bestAsk, spread: book.spread ? parseDec(book.spread) : cur.spread };
-                }
-                const rec = this.deps.scanner.recordAnomaly(cand, snap);
-                result.byKind[cand.kind] = (result.byKind[cand.kind] ?? 0) + 1;
-                if (rec.inserted) result.created++;
-                // 入队（市场异动优先，且有自己的每轮上限，不与钱包事件互相挤占）
-                const row = this.repos.db.get<MarketAnomalyRow & Record<string, unknown>>('SELECT * FROM market_anomalies WHERE id=?', rec.id);
-                if (row && this.cycleMarketEnqueued < cfg.push.maxMarketPerCycle) {
-                    const movers = this.deps.scanner.recentMovers(cand.conditionId, 3);
-                    const rep = this.reports.marketAnomalyReport(row as unknown as MarketAnomalyRow, { movers, shadow: cfg.shadowMode });
-                    const enq = this.deps.outbox.enqueue(`alert:${cand.dedupeKey}`, {
-                        chatId: cfg.telegram.chatIds[0] ?? '', title: rep.title, body: rep.body,
-                        wallet: '', conditionId: cand.conditionId, priority: cand.priority, dataQuality: cand.dataQuality,
-                    });
-                    if (enq.inserted) { result.enqueued++; this.cycleMarketEnqueued++; }
+                if (cand.priority === 'low') { result.byKind[cand.kind] = (result.byKind[cand.kind] ?? 0) + 1; continue; }
+                pending.push({ cand, snap: cur });
+            }
+        }
+        pending.sort((a, b) => {
+            const pr = (x: string) => (x === 'high' ? 0 : 1);
+            if (pr(a.cand.priority) !== pr(b.cand.priority)) return pr(a.cand.priority) - pr(b.cand.priority);
+            return (decToNumber(b.snap.volume24h ?? ZERO) ?? 0) - (decToNumber(a.snap.volume24h ?? ZERO) ?? 0);
+        });
+
+        let bookEnriched = 0, moverPulls = 0;
+        for (const { cand, snap: baseSnap } of pending) {
+            let snap = baseSnap;
+            result.byKind[cand.kind] = (result.byKind[cand.kind] ?? 0) + 1;
+
+            // ---- 盘口：gamma 的标量盘口只对应第一个结果 → 需要报警的异动一律补 CLOB 精确盘口 ----
+            const needBook = snap.bestBid === null || snap.bestAsk === null || cand.kind === 'spread_widen';
+            if (needBook && bookEnriched < cfg.rules.marketBookEnrichPerCycle && cand.tokenId) {
+                bookEnriched++;
+                const book = await this.deps.scanner.enrichBook(cand.tokenId);
+                if (book.ok) {
+                    snap = {
+                        ...snap,
+                        bestBid: book.bestBid ? parseDec(book.bestBid) : snap.bestBid,
+                        bestAsk: book.bestAsk ? parseDec(book.bestAsk) : snap.bestAsk,
+                        spread: book.spread ? parseDec(book.spread) : snap.spread,
+                    };
+                } else {
+                    this.repos.addGap('market', cand.conditionId, 'query_failed', `盘口补充失败（${cand.tokenId.slice(0, 10)}…）：${book.error}`);
                 }
             }
+
+            // ---- 谁在动：给异动市场补一次成交流水（同市场 10 分钟内不重复拉）----
+            if (moverPulls < cfg.rules.marketMoverPullsPerCycle) {
+                const mv = await this.deps.scanner.ensureTradesFor(cand.conditionId);
+                if (mv.ok && !mv.skipped) moverPulls++;
+            }
+
+            const rec = this.deps.scanner.recordAnomaly(cand, snap);
+            if (rec.inserted) result.created++;
+            const row = this.repos.db.get<MarketAnomalyRow & Record<string, unknown>>('SELECT * FROM market_anomalies WHERE id=?', rec.id);
+            if (!row) continue;
+            if (this.cycleMarketEnqueued >= cfg.push.maxMarketPerCycle) continue;
+            const movers = this.deps.scanner.recentMovers(cand.conditionId, 3);
+            const rep = this.reports.marketAnomalyReport(row as unknown as MarketAnomalyRow, { movers, shadow: cfg.shadowMode });
+            const enq = this.deps.outbox.enqueue(`alert:${cand.dedupeKey}`, {
+                chatId: cfg.telegram.chatIds[0] ?? '', title: rep.title, body: rep.body,
+                wallet: '', conditionId: cand.conditionId, priority: cand.priority, dataQuality: cand.dataQuality,
+            });
+            if (enq.inserted) { result.enqueued++; this.cycleMarketEnqueued++; }
         }
         return { scan: { observed: scan.observed, markets: scan.markets, stoppedBecause: scan.stoppedBecause }, anomalies: result };
     }

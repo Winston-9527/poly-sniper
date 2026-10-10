@@ -13,7 +13,8 @@
 import { Repos } from '../db/repos.js';
 import { DataApiClient } from '../sources/DataApi.js';
 import { HttpClient, RequestBudget } from '../sources/http.js';
-import { GammaMarket } from '../sources/contracts.js';
+import { GammaMarket, assignSyntheticKeys, CONTRACT_VERSION } from '../sources/contracts.js';
+import { slimPayload } from '../ledger/Collector.js';
 import { Config, RULES_VERSION } from '../config.js';
 import { Dec, cmp, decToNumber, decToString, parseDec, sub, abs, ZERO } from '../util/decimal.js';
 import { nowIso } from '../util/time.js';
@@ -81,9 +82,9 @@ export function anomalyRulesFromConfig(cfg: Config): AnomalyRules {
         windowMinutes: cfg.rules.marketWindowMinutes ?? 15,
         spreadRatio: cfg.rules.marketSpreadRatio ?? 0.1,
         spreadRatioHigh: cfg.rules.marketSpreadRatioHigh ?? 0.25,
-        spreadGrowth: cfg.rules.marketSpreadGrowth ?? 1.5,
-        minMidPrice: cfg.rules.marketMinMidPrice ?? 0.05,
-        minAbsSpread: cfg.rules.marketMinAbsSpread ?? 0.01,
+        spreadGrowth: cfg.rules.marketSpreadGrowth ?? 2,
+        minMidPrice: cfg.rules.marketMinMidPrice ?? 0.08,
+        minAbsSpread: cfg.rules.marketMinAbsSpread ?? 0.02,
         volumeSurge: cfg.rules.marketVolumeSurge ?? 3,
         volumeSurgeHigh: cfg.rules.marketVolumeSurgeHigh ?? 8,
         minVolume24h: cfg.rules.marketMinVolume24h ?? 5000,
@@ -258,18 +259,49 @@ export class MarketScanner {
         };
     }
 
-    /** 精确盘口：CLOB /price 双边 + /spread（只对已判定异动的 token 调用） */
-    async enrichBook(tokenId: string): Promise<{ ok: boolean; bestBid: string | null; bestAsk: string | null; spread: string | null; error?: string }> {
-        const bid = await this.deps.http.getJson<{ price?: string }>(`https://clob.polymarket.com/price?token_id=${tokenId}&side=sell`, 'clob/price');
+    /**
+     * 精确盘口：CLOB `/price` 双边（买=buy、卖=sell），价差用二者相减自行计算。
+     * 只对「即将报警的异动 token」调用，每轮有次数上限；缺失写 null 而不是 0。
+     * 注意：gamma 的标量盘口只对应第一个结果，所以第二个结果必须走这里补。
+     */
+    async enrichBook(tokenId: string): Promise<{ ok: boolean; bestBid: string | null; bestAsk: string | null; spread: string | null; error?: string; requests: number }> {
         const ask = await this.deps.http.getJson<{ price?: string }>(`https://clob.polymarket.com/price?token_id=${tokenId}&side=buy`, 'clob/price');
-        const sp = await this.deps.http.getJson<{ spread?: string }>(`https://clob.polymarket.com/spread?token_id=${tokenId}`, 'clob/spread');
-        if (!bid.ok && !ask.ok) return { ok: false, bestBid: null, bestAsk: null, spread: null, error: bid.error };
-        return {
-            ok: true,
-            bestBid: bid.ok ? (bid.data.price ?? null) : null,
-            bestAsk: ask.ok ? (ask.data.price ?? null) : null,
-            spread: sp.ok ? (sp.data.spread ?? null) : null,
-        };
+        const bid = await this.deps.http.getJson<{ price?: string }>(`https://clob.polymarket.com/price?token_id=${tokenId}&side=sell`, 'clob/price');
+        const askP = ask.ok ? (ask.data.price ?? null) : null;
+        const bidP = bid.ok ? (bid.data.price ?? null) : null;
+        let spread: string | null = null;
+        if (askP && bidP) spread = decToString(sub(parseDec(askP), parseDec(bidP))!);
+        if (!ask.ok && !bid.ok) return { ok: false, bestBid: null, bestAsk: null, spread: null, error: ask.error, requests: 2 };
+        return { ok: true, bestBid: bidP, bestAsk: askP, spread, requests: 2 };
+    }
+
+    /**
+     * 为异动市场补一次成交流水（1 页 = 500 笔），用于报告里的「谁在动」。
+     * 同一市场在 freshMinutes 内不重复拉取；只存原始记录 + 登记钱包，不写入候选/关注名单。
+     */
+    async ensureTradesFor(conditionId: string, opts: { freshMinutes?: number } = {}): Promise<{ ok: boolean; rows: number; skipped?: string; error?: string }> {
+        const freshMinutes = opts.freshMinutes ?? 10;
+        const last = this.repos.db.get<{ observed_at: string }>(
+            `SELECT observed_at FROM source_records WHERE source='data-api/trades' AND market_condition_id=? ORDER BY id DESC LIMIT 1`,
+            conditionId,
+        );
+        if (last?.observed_at && Date.now() - Date.parse(String(last.observed_at)) < freshMinutes * 60_000) {
+            return { ok: true, rows: 0, skipped: `该市场成交流水在 ${freshMinutes} 分钟内已取过，不重复请求` };
+        }
+        const r = await this.deps.dataApi.getTrades(conditionId, { limit: 500, offset: 0 });
+        if (!r.ok) {
+            this.repos.addGap('market', conditionId, r.kind === 'contract' ? 'contract_mismatch' : r.kind === 'budget' ? 'budget_exhausted' : 'query_failed', `异动市场的成交流水未取到：${r.error}`);
+            return { ok: false, rows: 0, error: r.error };
+        }
+        const keyed = assignSyntheticKeys(r.data);
+        this.repos.db.tx(() => {
+            this.repos.insertSourceRecord({
+                source: 'data-api/trades', sourceKey: `trades:${conditionId}:anomaly`, syntheticKey: true, wallet: null,
+                conditionId, payload: slimPayload(keyed), eventAt: keyed[0]?.eventAt ?? null, observedAt: nowIso(), contractVersion: CONTRACT_VERSION,
+            });
+            for (const t of keyed) this.repos.ensureWallet(t.wallet);
+        });
+        return { ok: true, rows: keyed.length };
     }
 
     /**
