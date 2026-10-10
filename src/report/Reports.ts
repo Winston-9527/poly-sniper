@@ -170,8 +170,12 @@ export class Reports {
         lines.push(`<b>${Reports.kindEmoji(a.kind, delta)} ${escapeHtml(label)}</b>${opts.shadow ? '  <i>[影子模式]</i>' : ''}`);
         lines.push(`🏷 ${url ? this.link(question.slice(0, 60), url) : escapeHtml(question)}`);
 
-        if (a.price_after) {
-            const tail = a.kind === 'price_move' && a.price_before
+        // ⚠️ 字段语义按 kind 区分（不能混用）：
+        //   price_move   → price_before/after 是价格
+        //   spread_widen → price_before 是上一条买一、price_after 是当前买一，delta 是当前价差
+        //   volume_surge → price_before/after 是 24h 成交量（不是价格！此前被当「现价」显示成 9658.29）
+        if (a.kind === 'price_move' && a.price_after) {
+            const tail = a.price_before
                 ? ` ${Reports.arrow(delta)} ${Reports.signedPctPoints(delta ?? 0)}（${a.window_minutes} 分钟 ${fmtQty(a.price_before)} → ${fmtQty(a.price_after)}）`
                 : (a.outcome ? `（结果 ${escapeHtml(a.outcome)}）` : '');
             lines.push(`💰 现价 <b>${fmtQty(a.price_after)}</b>${tail}`);

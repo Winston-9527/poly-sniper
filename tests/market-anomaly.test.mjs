@@ -337,3 +337,25 @@ test('长尾聚焦兜底：slug 带「今天/明天」日期段的一律排除�
     assert.match(String(sc.exclusionReason({ slug: 'wwcquefa-isr-swi-2026-10-09-isr', endDate: new Date(Date.now() + 300 * 86400_000).toISOString() })), /sports_esports_slug:wwcquefa/);
     app.close();
 });
+
+test('字段语义按 kind 区分：成交量突增不能把「成交量」当「现价」显示', () => {
+    const app = mkApp();
+    seedMarket(app.repos);
+    // volume_surge 的 price_before/after 存的是 24h 成交量
+    const rec = app.repos.insertMarketAnomaly({
+        dedupeKey: 'ma:vol:1', conditionId: CID, tokenId: TOKEN, outcome: 'No', kind: 'volume_surge',
+        windowMinutes: 73, priceBefore: '1571', priceAfter: '9658.2924', delta: null,
+        bestBid: '0.986', bestAsk: '0.987', spread: '0.001', volume24h: '9658.2924', liquidity: '422000',
+        change1h: null, change24h: null, priority: 'high',
+        reason: '成交量突增：73 分钟内 24h 成交量 $1571 → $9658（6.1 倍，阈值 3 倍）',
+        dataQuality: 'verified', ruleVersion: 'p1-rules-2',
+        eventAt: '2026-10-10T12:00:00.000Z', observedAt: '2026-10-10T12:00:01.000Z',
+    });
+    const row = app.repos.db.get('SELECT * FROM market_anomalies WHERE id=?', rec.id);
+    const body = new Reports(app.repos, app.cfg).marketAnomalyReport(row, {}).body;
+    assert.equal(/现价/.test(body), false, '成交量突增不显示「现价」');
+    assert.match(body, /🔥 成交量突增/);
+    assert.match(body, /🎯 结果 No/);
+    assert.match(body, /6\.1 倍/);
+    app.close();
+});
