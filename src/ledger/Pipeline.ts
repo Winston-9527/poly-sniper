@@ -534,18 +534,29 @@ export class LedgerPipeline {
         if (!scanner || st.marketFollowHours <= 0) return out;
         const now = nowIso();
         out.expired = this.repos.expireFollowups(now);
+        // 规则可以随时加（例如「马斯克推特计数盘放弃」）：未到期的跟踪也要立刻按新规则清一遍，
+        // 否则要等到各自到期才停跟（期间还会推消息）。
+        for (const f of this.repos.db.all<Record<string, unknown>>(`SELECT id, condition_id FROM market_followups WHERE state='active' LIMIT 500`)) {
+            const mk = this.repos.market(String(f.condition_id));
+            if (!mk) continue;
+            const why = scanner.exclusionReason({ slug: mk.slug ?? '', endDate: mk.end_date ?? undefined } as unknown as GammaMarket);
+            if (!why) continue;
+            this.repos.updateFollowup(Number(f.id), { state: 'expired', lastCheckAt: now });
+            out.skipped++;
+            this.deps.log(`[follow] 停止跟踪 ${String(f.condition_id).slice(0, 12)}…（${why}）`);
+        }
         const due = this.repos.dueFollowups(now, Math.max(0, st.marketFollowMaxPerCycle));
         for (const f of due) {
             const cid = String(f.condition_id);
             const tokenId = f.token_id === null || f.token_id === undefined ? null : String(f.token_id);
             // 规则可以后加（例如「马斯克的推特计数盘放弃」）：命中排除类别的市场立即停止跟踪
-            const mk = this.repos.market(cid);
-            if (mk) {
-                const why = scanner.exclusionReason({ slug: mk.slug ?? '', endDate: mk.end_date ?? undefined } as unknown as GammaMarket);
-                if (why) {
+            const mk2 = this.repos.market(cid);
+            if (mk2) {
+                const why2 = scanner.exclusionReason({ slug: mk2.slug ?? '', endDate: mk2.end_date ?? undefined } as unknown as GammaMarket);
+                if (why2) {
                     this.repos.updateFollowup(Number(f.id), { state: 'expired', lastCheckAt: nowIso() });
                     out.skipped++;
-                    this.deps.log(`[follow] ${cid.slice(0, 12)}… 停止跟踪：${why}`);
+                    this.deps.log(`[follow] ${cid.slice(0, 12)}… 停止跟踪：${why2}`);
                     continue;
                 }
             }
