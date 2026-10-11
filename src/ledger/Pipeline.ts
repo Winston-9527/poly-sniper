@@ -489,10 +489,12 @@ export class LedgerPipeline {
             // 因为这两种异动的 price_before/after 存的不是价格（盘口是买一、成交量是金额）。
             const kind = String(row.kind);
             let basePrice: string | null = kind === 'price_move' ? (row.price_after ?? row.price_before ?? null) : null;
-            if (basePrice === null) {
+            if (basePrice === null && cand.tokenId) {
+                // 必须按**该异动自己的 token** 取基准价：二选一市场里 Yes=0.9995 / No=0.0005，
+                // 取错边会算出「-99.9 个点」这种假变化（实测踩过）。
                 const near = this.repos.db.get<{ price: string | null }>(
-                    `SELECT price FROM market_observations WHERE condition_id=? AND price IS NOT NULL AND observed_at <= ? ORDER BY observed_at DESC LIMIT 1`,
-                    cand.conditionId, String(row.observed_at),
+                    `SELECT price FROM market_observations WHERE condition_id=? AND token_id=? AND price IS NOT NULL AND observed_at <= ? ORDER BY observed_at DESC LIMIT 1`,
+                    cand.conditionId, cand.tokenId, String(row.observed_at),
                 );
                 basePrice = near?.price ?? null;
             }

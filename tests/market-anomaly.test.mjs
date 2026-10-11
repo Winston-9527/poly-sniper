@@ -543,3 +543,32 @@ test('请求预算必须每轮重置：不重置会在跑满后让市场扫描�
     assert.equal(budget.trySpend('y'), true, '重置后重新可用');
     app.close();
 });
+
+test('跟踪基准价必须取「该异动自己的 token」的价：二选一市场取错边会算出 -99.9 个点的假变化', async () => {
+    const T_YES = '0x' + 'a'.repeat(64);
+    const T_NO = '0x' + 'b'.repeat(64);
+    const app = mkApp({
+        config: { rules: { marketFollowHours: 24, marketFollowIntervalMin: 30, marketFollowMaxPerCycle: 5, marketFollowMove: 0.05 } },
+        httpHandler: async (url) => ({ ok: true, data: { price: url.includes('side=buy') ? '0.0004' : '0.0006' }, status: 200, ms: 1, url }),
+    });
+    seedMarket(app.repos);
+    // 同一市场两个结果：Yes 0.9995、No 0.0005（都是异动前的观察）
+    app.repos.insertMarketObservation({ conditionId: CID, tokenId: T_YES, price: '0.9995', volume24h: '4000', liquidity: '500000', observedAt: '2026-10-11T05:59:00.000Z' });
+    app.repos.insertMarketObservation({ conditionId: CID, tokenId: T_NO, price: '0.0005', volume24h: '4000', liquidity: '500000', observedAt: '2026-10-11T05:59:30.000Z' });
+    // 异动发生在 No 这个 token 上
+    const an = app.repos.insertMarketAnomaly({
+        dedupeKey: 'ma:tk:1', conditionId: CID, tokenId: T_NO, outcome: 'No', kind: 'volume_surge',
+        windowMinutes: 10, priceBefore: '900', priceAfter: '6000', delta: null,
+        bestBid: '0.0004', bestAsk: '0.0006', spread: '0.0002', volume24h: '6000', liquidity: '500000',
+        change1h: null, change24h: null, priority: 'high', reason: '放量', dataQuality: 'verified',
+        ruleVersion: 'p1-rules-2', eventAt: '2026-10-11T06:00:00.000Z', observedAt: '2026-10-11T06:00:01.000Z',
+    });
+    const past = new Date(Date.now() - 60_000).toISOString();
+    app.repos.addFollowup({ conditionId: CID, tokenId: T_NO, anomalyId: an.id, kind: 'volume_surge', direction: 'either', basePrice: '0.0005', nextCheckAt: past, followUntil: new Date(Date.now() + 86400_000).toISOString() });
+    const r = await app.pipeline.followDueMarkets();
+    assert.equal(r.checked, 1);
+    const row = app.repos.db.get("SELECT last_price FROM market_followups WHERE condition_id=?", CID);
+    assert.equal(Number(row.last_price) < 0.01, true, `现价应在 0.0005 附近（No 那边），而不是 0.9995：${row.last_price}`);
+    assert.equal(r.alerted, 0, '相对 No 自己的 0.0005 只变化 0.0000，不应报 -99.9 个点的假变化');
+    app.close();
+});
