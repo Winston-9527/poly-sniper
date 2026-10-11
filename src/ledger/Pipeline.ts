@@ -35,7 +35,7 @@ export interface CycleReport {
     /** 市场扫描（首要信号） */
     marketScan: { observed: number; markets: number; stoppedBecause: string; excluded: Record<string, number> } | null;
     marketAnomalies: { created: number; enqueued: number; byKind: Record<string, number> };
-    marketFollow: { checked: number; alerted: number; expired: number };
+    marketFollow: { checked: number; alerted: number; expired: number; skipped: number };
     budget: { spent: number; limit: number; exhaustedSources: string[] };
     markets: string[];
     discovered: { market: string; added: number; skippedOverBudget: number; byEntry: Record<string, number> }[];
@@ -526,11 +526,11 @@ export class LedgerPipeline {
      * 对到期的跟踪市场：补盘口（CLOB 双边）+ 补成交流水（10 分钟内不重复拉），
      * 记录一条观察，然后判断「是否继续同向发展」——只有够门槛才再推一条，避免长尾市场刷屏。
      */
-    async followDueMarkets(): Promise<{ checked: number; alerted: number; expired: number }> {
+    async followDueMarkets(): Promise<{ checked: number; alerted: number; expired: number; skipped: number }> {
         const cfg = this.deps.config;
         const st = cfg.rules;
         const scanner = this.deps.scanner;
-        const out = { checked: 0, alerted: 0, expired: 0 };
+        const out = { checked: 0, alerted: 0, expired: 0, skipped: 0 };
         if (!scanner || st.marketFollowHours <= 0) return out;
         const now = nowIso();
         out.expired = this.repos.expireFollowups(now);
@@ -538,6 +538,17 @@ export class LedgerPipeline {
         for (const f of due) {
             const cid = String(f.condition_id);
             const tokenId = f.token_id === null || f.token_id === undefined ? null : String(f.token_id);
+            // 规则可以后加（例如「马斯克的推特计数盘放弃」）：命中排除类别的市场立即停止跟踪
+            const mk = this.repos.market(cid);
+            if (mk) {
+                const why = scanner.exclusionReason({ slug: mk.slug ?? '', endDate: mk.end_date ?? undefined } as unknown as GammaMarket);
+                if (why) {
+                    this.repos.updateFollowup(Number(f.id), { state: 'expired', lastCheckAt: nowIso() });
+                    out.skipped++;
+                    this.deps.log(`[follow] ${cid.slice(0, 12)}… 停止跟踪：${why}`);
+                    continue;
+                }
+            }
             out.checked++;
             let mid: Dec | null = null;
             let bestBid: string | null = null, bestAsk: string | null = null, spread: string | null = null;

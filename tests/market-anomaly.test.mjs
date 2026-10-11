@@ -243,9 +243,9 @@ test('长尾聚焦：排除高频结算（小时级币价盘/当天球赛）与�
     const sc = app.scanner;
     const iso = (h) => new Date(Date.now() + h * 3600_000).toISOString();
     // 体育/电竞：slug 首段命中联赛表（即使几个月后才结算也排除）
-    assert.match(String(sc.exclusionReason({ slug: 'epl-ars-lee-2026-10-10-ars', endDate: iso(200) })), /sports_esports_slug:epl/);
-    assert.match(String(sc.exclusionReason({ slug: 'cs2-navi-vs-faze-bo3', endDate: iso(100) })), /sports_esports_slug:cs2/);
-    assert.match(String(sc.exclusionReason({ slug: 'nba-lal-bos-2026-12-25', endDate: iso(1000) })), /sports_esports_slug:nba/);
+    assert.match(String(sc.exclusionReason({ slug: 'epl-ars-lee-2026-10-10-ars', endDate: iso(200) })), /excluded_slug:epl/);
+    assert.match(String(sc.exclusionReason({ slug: 'cs2-navi-vs-faze-bo3', endDate: iso(100) })), /excluded_slug:cs2/);
+    assert.match(String(sc.exclusionReason({ slug: 'nba-lal-bos-2026-12-25', endDate: iso(1000) })), /excluded_slug:nba/);
     // 高频模式：updown/hourly/15m/1h（结束时间再远也排除）
     assert.match(String(sc.exclusionReason({ slug: 'bitcoin-updown-15m-2026-10-10-1500', endDate: iso(300) })), /same_day_slug|high_frequency_slug/);
     assert.equal(sc.exclusionReason({ slug: 'eth-hourly-price-2026-11-01', endDate: iso(400) }), 'high_frequency_slug');
@@ -275,9 +275,9 @@ test('长尾聚焦：slug 里含联赛/赛事名（首段是 will 的）也要�
     const app = mkApp();
     const sc = app.scanner;
     const iso = (h) => new Date(Date.now() + h * 3600_000).toISOString();
-    assert.match(String(sc.exclusionReason({ slug: 'will-vitality-win-the-esl-pro-league-season-24', endDate: iso(2000) })), /sports_esports_keyword:esl/);
-    assert.match(String(sc.exclusionReason({ slug: 'will-novak-djokovic-win-wimbledon-2027', endDate: iso(5000) })), /sports_esports_keyword:wimbledon/);
-    assert.match(String(sc.exclusionReason({ slug: 'will-real-madrid-win-la-liga-2027', endDate: iso(3000) })), /sports_esports_keyword:la-liga/);
+    assert.match(String(sc.exclusionReason({ slug: 'will-vitality-win-the-esl-pro-league-season-24', endDate: iso(2000) })), /excluded_kw:esl/);
+    assert.match(String(sc.exclusionReason({ slug: 'will-novak-djokovic-win-wimbledon-2027', endDate: iso(5000) })), /excluded_kw:wimbledon/);
+    assert.match(String(sc.exclusionReason({ slug: 'will-real-madrid-win-la-liga-2027', endDate: iso(3000) })), /excluded_kw:la-liga/);
     // 不该误伤的：含相似片段的非体育市场
     assert.equal(sc.exclusionReason({ slug: 'will-openai-release-gpt-6-by-december-2026', endDate: iso(1500) }), null);
     assert.equal(sc.exclusionReason({ slug: 'will-the-us-enter-a-recession-in-2027', endDate: iso(2000) }), null);
@@ -317,7 +317,7 @@ test('钱包事件也做长尾过滤：体育/电竞市场里的钱包变化不�
     const app2 = app;
     app2.repos.upsertMarket({ conditionId: '0xcs2market', slug: 'cs2-fal2-ts7-2026-10-09', question: 'CS2: FAL2 vs TS7', endDate: '2026-10-12T00:00:00Z' });
     const excluded = app2.scanner.exclusionReason({ slug: 'cs2-fal2-ts7-2026-10-09', endDate: '2026-10-12T00:00:00Z' });
-    assert.match(String(excluded), /sports_esports_slug:cs2/);
+    assert.match(String(excluded), /excluded_slug:cs2/);
     const kept = app2.scanner.exclusionReason({ slug: 'will-thomas-massie-win-the-2028-republican-presidential-nomination', endDate: '2028-01-01T00:00:00Z' });
     assert.equal(kept, null);
     app.close();
@@ -329,12 +329,12 @@ test('长尾聚焦兜底：slug 带「今天/明天」日期段的一律排除�
     const today = new Date().toISOString().slice(0, 10);
     const tomorrow = new Date(Date.now() + 24 * 3600_000).toISOString().slice(0, 10);
     // 澳大利亚 NBL 篮球：前缀表里没有 bknbl，结束时间还得一周 → 靠日期段兜住
-    assert.match(String(sc.exclusionReason({ slug: `bknbl-per-new-${today}`, endDate: new Date(Date.now() + 7 * 86400_000).toISOString() })), /same_day_slug|sports_esports_slug:bknbl/);
+    assert.match(String(sc.exclusionReason({ slug: `bknbl-per-new-${today}`, endDate: new Date(Date.now() + 7 * 86400_000).toISOString() })), /same_day_slug|excluded_slug:bknbl/);
     assert.match(String(sc.exclusionReason({ slug: `some-new-league-abc-xyz-${tomorrow}`, endDate: new Date(Date.now() + 7 * 86400_000).toISOString() })), /same_day_slug/);
     // 远期的日期段不该被误伤
     assert.equal(sc.exclusionReason({ slug: 'will-x-happen-by-2027-12-31', endDate: new Date(Date.now() + 400 * 86400_000).toISOString() }), null);
     // 女足世预赛前缀
-    assert.match(String(sc.exclusionReason({ slug: 'wwcquefa-isr-swi-2026-10-09-isr', endDate: new Date(Date.now() + 300 * 86400_000).toISOString() })), /sports_esports_slug:wwcquefa/);
+    assert.match(String(sc.exclusionReason({ slug: 'wwcquefa-isr-swi-2026-10-09-isr', endDate: new Date(Date.now() + 300 * 86400_000).toISOString() })), /excluded_slug:wwcquefa/);
     app.close();
 });
 
@@ -570,5 +570,37 @@ test('跟踪基准价必须取「该异动自己的 token」的价：二选一�
     const row = app.repos.db.get("SELECT last_price FROM market_followups WHERE condition_id=?", CID);
     assert.equal(Number(row.last_price) < 0.01, true, `现价应在 0.0005 附近（No 那边），而不是 0.9995：${row.last_price}`);
     assert.equal(r.alerted, 0, '相对 No 自己的 0.0005 只变化 0.0000，不应报 -99.9 个点的假变化');
+    app.close();
+});
+
+test('放弃高频社媒计数盘：马斯克推特条数类市场排除，但不误伤马斯克的政治盘', () => {
+    const app = mkApp();
+    const sc = app.scanner;
+    const iso = (h) => new Date(Date.now() + h * 3600_000).toISOString();
+    // 推特条数盘（几天就结算、高频高波动）
+    assert.match(String(sc.exclusionReason({ slug: 'elon-musk-post-40-tweets-from-october-10-to-october-12', endDate: iso(40) })), /excluded_kw:tweets/);
+    assert.match(String(sc.exclusionReason({ slug: 'will-elon-musk-post-100-tweets-this-week', endDate: iso(60) })), /excluded_kw:tweets/);
+    // 不误伤：马斯克的政治/公司类长尾市场
+    assert.equal(sc.exclusionReason({ slug: 'will-elon-musk-win-the-2028-us-presidential-election', endDate: iso(8000) }), null);
+    assert.equal(sc.exclusionReason({ slug: 'will-tesla-launch-a-robotaxi-in-2027', endDate: iso(6000) }), null);
+    app.close();
+});
+
+test('规则后加也生效：已在跟踪队列里的市场，命中排除类别就立即停止跟踪', async () => {
+    const app = mkApp();
+    seedMarket(app.repos);
+    app.repos.upsertMarket({ conditionId: '0xtweets', slug: 'elon-musk-post-40-tweets-from-october-10-to-october-12', question: 'Musk tweets?', endDate: new Date(Date.now() + 40 * 3600_000).toISOString() });
+    const an = app.repos.insertMarketAnomaly({
+        dedupeKey: 'ma:tw:1', conditionId: '0xtweets', tokenId: TOKEN, outcome: 'Yes', kind: 'price_move',
+        windowMinutes: 5, priceBefore: '0.4', priceAfter: '0.5', delta: '0.1',
+        bestBid: '0.49', bestAsk: '0.51', spread: '0.02', volume24h: '3000', liquidity: '5000',
+        change1h: null, change24h: null, priority: 'high', reason: 'r', dataQuality: 'verified',
+        ruleVersion: 'p1-rules-2', eventAt: '2026-10-11T06:00:00.000Z', observedAt: '2026-10-11T06:00:01.000Z',
+    });
+    app.repos.addFollowup({ conditionId: '0xtweets', tokenId: TOKEN, anomalyId: an.id, kind: 'price_move', direction: 'up', basePrice: '0.5', nextCheckAt: new Date(Date.now() - 60_000).toISOString(), followUntil: new Date(Date.now() + 86400_000).toISOString() });
+    const r = await app.pipeline.followDueMarkets();
+    assert.equal(r.skipped, 1, '命中排除类别要停跟');
+    assert.equal(r.checked, 0, '不必再花请求去复查');
+    assert.equal(app.repos.db.get("SELECT state FROM market_followups WHERE condition_id='0xtweets'").state, 'expired', '标记为已过期（停止跟踪）');
     app.close();
 });

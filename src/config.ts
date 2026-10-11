@@ -228,6 +228,8 @@ export function loadConfig(): Config {
                 'world-series', 'stanley-cup', 'wimbledon', 'grand-slam', 'us-open', 'french-open',
                 'australian-open', 'olympics', 'ufc', 'boxing', 'formula-1', 'f1-',
                 'nba', 'nfl', 'mlb', 'nhl', 'wnba', 'ncaa', 'atp', 'wta', 'cricket', 'ipl',
+                // 高频高波动的社媒计数盘（马斯克推特条数这类）：几天就结算、噪声大，明确放弃
+                'tweets', 'truth-social-posts',
             ]),
             marketMoverPullsPerCycle: envNum('MARKET_MOVER_PULLS_PER_CYCLE', 4),
             marketBookEnrichPerCycle: envNum('MARKET_BOOK_ENRICH_PER_CYCLE', 6),

@@ -389,11 +389,11 @@ export class MarketScanner {
         if (!slug) return 'no_slug';
         const prefixes = r.marketExcludePrefixes ?? [];
         const head = slug.split('-')[0];
-        if (prefixes.includes(head)) return `sports_esports_slug:${head}`;
+        if (prefixes.includes(head)) return `excluded_slug:${head}`;
         for (const kw of r.marketExcludeKeywords ?? []) {
             if (!kw) continue;
             // slug 用 - 分词：按「词边界」匹配，避免 nba 命中无关词
-            if (new RegExp(`(^|-)${kw.replace(/[-]/g, '\\-')}(-|$)`).test(slug)) return `sports_esports_keyword:${kw}`;
+            if (new RegExp(`(^|-)${kw.replace(/[-]/g, '\\-')}(-|$)`).test(slug)) return `excluded_kw:${kw}`;
         }
         // slug 里带「今天/明天」的 ISO 日期段 → 当天或隔天结算（球赛、小时盘）。
         // 这一条不需要知道是哪个联赛，能兜住 bknbl-…-2026-10-10 这类没见过的联赛码。
