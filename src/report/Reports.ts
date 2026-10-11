@@ -159,7 +159,7 @@ export class Reports {
      * 市场异动报告：一眼看到「涨还是跌 / 现价 / 盘口 / 谁在动（含画像分）」。
      * 事件时间与规则版本不再展示（用户要求）；但数据不完整时仍显式标注，不假装完整。
      */
-    marketAnomalyReport(a: MarketAnomalyRow, opts: { movers?: { wallet: string; buy: string; sell: string; trades: number }[]; shadow?: boolean } = {}): { title: string; body: string } {
+    marketAnomalyReport(a: MarketAnomalyRow, opts: { movers?: { wallet: string; buy: string; sell: string; trades: number }[]; moverNote?: string; shadow?: boolean } = {}): { title: string; body: string } {
         const market = this.repos.market(a.condition_id);
         const question = String(market?.question ?? `condition ${a.condition_id.slice(0, 12)}…`);
         const url = this.marketUrl(market);
@@ -210,7 +210,7 @@ export class Reports {
         lines.push('');
 
         if (opts.movers?.length) {
-            lines.push('👀 <b>谁在动</b>（该市场最近已获取的成交，非全市场）');
+            lines.push(`👀 <b>谁在动</b>${opts.moverNote ?? '（该市场最近已获取的成交，非全市场）'}`);
             for (const m of opts.movers) for (const l of this.walletMoverLines(m)) lines.push(l);
         } else {
             lines.push('👀 谁在动：未取到该市场的成交流水（这是缺口，不是「没人交易」）');

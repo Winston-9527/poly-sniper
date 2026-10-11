@@ -13,7 +13,7 @@ import { buildBehavior, ChangeForBehavior, PriorityRules, isReactivation } from 
 import { MarketScanner, MarketSnapshot, AnomalyCandidate, AnomalyRules, detectAnomaly, anomalyRulesFromConfig } from '../market/MarketScanner.js';
 import { GammaMarket } from '../sources/contracts.js';
 import { decToString, fromDb, parseDec, mul, div, decToNumber, Dec, ZERO } from '../util/decimal.js';
-import { nowIso } from '../util/time.js';
+import { nowIso, toDisplay } from '../util/time.js';
 
 export interface ProcessResult {
     wallet: string;
@@ -411,8 +411,12 @@ export class LedgerPipeline {
             return (decToNumber(b.snap.volume24h ?? ZERO) ?? 0) - (decToNumber(a.snap.volume24h ?? ZERO) ?? 0);
         });
 
+        // 已报过的候选（同一市场+同方向，冷却窗口内）不再花预算补盘口/成交流水，
+        // 否则每轮的补数额度会被重复候选吃光，真正的新异动反而拿不到「谁在动」。
+        const fresh = pending.filter((p) => !this.repos.db.get('SELECT id FROM market_anomalies WHERE dedupe_key=?', p.cand.dedupeKey));
+
         let bookEnriched = 0, moverPulls = 0;
-        for (const { cand, snap: baseSnap } of pending) {
+        for (const { cand, snap: baseSnap } of fresh) {
             let snap = baseSnap;
             result.byKind[cand.kind] = (result.byKind[cand.kind] ?? 0) + 1;
 
@@ -443,7 +447,11 @@ export class LedgerPipeline {
                 const mv = await this.deps.scanner.ensureTradesFor(cand.conditionId);
                 if (mv.ok && !mv.skipped) moverPulls++;
             }
-            const movers = this.deps.scanner.recentMovers(cand.conditionId, 3);
+            const mvMeta = this.deps.scanner.recentMovers(cand.conditionId, 3);
+            const movers = mvMeta.movers;
+            const moverNote = mvMeta.fallback
+                ? `（${mvMeta.windowHours ?? 24} 小时内该市场没有新成交；以下是最接近窗口的最近成交${mvMeta.newestTradeAt ? `，最新一笔在 ${toDisplay(mvMeta.newestTradeAt)}` : ''}）`
+                : '（该市场最近已获取的成交，非全市场）';
             // 「谁在动」的钱包顺带纳入关注名单：下一轮起就会采集它们的活动/持仓，
             // 之后同一条异动的「谁在动」里就能带出画像分（而不是永远显示未采集）。
             for (const mv of movers) {
@@ -454,7 +462,7 @@ export class LedgerPipeline {
                     reason: `市场异动「谁在动」：${cand.kind}（本市场最近 ${mv.trades} 笔，买 $${mv.buy} / 卖 $${mv.sell}）`,
                 });
             }
-            const rep = this.reports.marketAnomalyReport(row as unknown as MarketAnomalyRow, { movers, shadow: cfg.shadowMode });
+            const rep = this.reports.marketAnomalyReport(row as unknown as MarketAnomalyRow, { movers, moverNote, shadow: cfg.shadowMode });
             const enq = this.deps.outbox.enqueue(`alert:${cand.dedupeKey}`, {
                 chatId: cfg.telegram.chatIds[0] ?? '', title: rep.title, body: rep.body,
                 wallet: '', conditionId: cand.conditionId, priority: cand.priority, dataQuality: cand.dataQuality,

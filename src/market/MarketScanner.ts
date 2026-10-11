@@ -297,7 +297,7 @@ export class MarketScanner {
      * 为异动市场补一次成交流水（1 页 = 500 笔），用于报告里的「谁在动」。
      * 同一市场在 freshMinutes 内不重复拉取；只存原始记录 + 登记钱包，不写入候选/关注名单。
      */
-    async ensureTradesFor(conditionId: string, opts: { freshMinutes?: number; windowHours?: number } = {}): Promise<{ ok: boolean; rows: number; skipped?: string; error?: string }> {
+    async ensureTradesFor(conditionId: string, opts: { freshMinutes?: number; windowHours?: number } = {}): Promise<{ ok: boolean; rows: number; skipped?: string; error?: string; movers?: number; fallback?: boolean }> {
         const freshMinutes = opts.freshMinutes ?? 10;
         const last = this.repos.db.get<{ observed_at: string }>(
             `SELECT observed_at FROM source_records WHERE source='data-api/trades' AND market_condition_id=? ORDER BY id DESC LIMIT 1`,
@@ -315,7 +315,16 @@ export class MarketScanner {
         const observedAt = nowIso();
         // 聚合出「谁在动」并存成一条小记录：
         // 原始页会因体积上限被截断（截断后 movers 读不出），所以聚合结果单独落库。
-        const movers = MarketScanner.aggregateMovers(keyed as unknown as Record<string, unknown>[], opts.windowHours ?? 6, 5);
+        const windowHours = opts.windowHours ?? this.deps.config.rules.marketMoverWindowHours ?? 24;
+        const rowsAll = keyed as unknown as Record<string, unknown>[];
+        let movers = MarketScanner.aggregateMovers(rowsAll, windowHours, 5);
+        let fallback = false;
+        if (!movers.length && rowsAll.length) {
+            // 长尾市场可能几小时才成交一次：窗口内没成交就退回「该市场最近成交」，并在报告里写明时间
+            movers = MarketScanner.aggregateMovers(rowsAll, null, 5);
+            fallback = movers.length > 0;
+        }
+        const newestTradeAt = rowsAll.length ? (String(rowsAll[0].eventAt ?? '') || null) : null;
         this.repos.db.tx(() => {
             this.repos.insertSourceRecord({
                 source: 'data-api/trades', sourceKey: `trades:${conditionId}:anomaly`, syntheticKey: true, wallet: null,
@@ -323,7 +332,7 @@ export class MarketScanner {
             });
             this.repos.insertSourceRecord({
                 source: 'derived/movers', sourceKey: `movers:${conditionId}:${observedAt}`, syntheticKey: true, wallet: null,
-                conditionId, payload: JSON.stringify({ movers, rows: keyed.length, windowHours: opts.windowHours ?? 6 }),
+                conditionId, payload: JSON.stringify({ movers, rows: keyed.length, windowHours, fallback, newestTradeAt }),
                 eventAt: observedAt, observedAt, contractVersion: CONTRACT_VERSION,
             });
             for (const t of keyed) this.repos.ensureWallet(t.wallet);
@@ -335,17 +344,23 @@ export class MarketScanner {
      * 「谁在动」：从最近落库的成交流水里取该市场窗口内成交额最大的几个钱包。
      * 只报告已获取到的页，并注明口径（不宣称全市场）。
      */
-    recentMovers(conditionId: string, limit = 3): { wallet: string; buy: string; sell: string; trades: number }[] {
+    recentMovers(conditionId: string, limit = 3): { movers: { wallet: string; buy: string; sell: string; trades: number }[]; windowHours: number | null; fallback: boolean; newestTradeAt: string | null } {
         const row = this.repos.db.get<{ payload: string }>(
             `SELECT payload FROM source_records WHERE source='derived/movers' AND market_condition_id=? ORDER BY id DESC LIMIT 1`,
             conditionId,
         );
-        if (!row) return [];
+        const empty = { movers: [], windowHours: null as number | null, fallback: false, newestTradeAt: null as string | null };
+        if (!row) return empty;
         try {
-            const parsed = JSON.parse(row.payload) as { movers?: unknown };
+            const parsed = JSON.parse(row.payload) as { movers?: unknown; windowHours?: number; fallback?: boolean; newestTradeAt?: string | null };
             const arr = Array.isArray(parsed.movers) ? parsed.movers as { wallet: string; buy: string; sell: string; trades: number }[] : [];
-            return arr.slice(0, limit);
-        } catch { return []; }
+            return {
+                movers: arr.slice(0, limit),
+                windowHours: parsed.windowHours ?? null,
+                fallback: parsed.fallback === true,
+                newestTradeAt: parsed.newestTradeAt ?? null,
+            };
+        } catch { return empty; }
     }
 
     /**
@@ -388,12 +403,13 @@ export class MarketScanner {
     }
 
     /** 把成交流水聚合成「谁在动」（金额用精确十进制相乘，不做二进制浮点累加） */
-    static aggregateMovers(rows: Record<string, unknown>[], windowHours: number, limit: number): { wallet: string; buy: string; sell: string; trades: number }[] {
-        const since = new Date(Date.now() - windowHours * 3600_000).toISOString();
+    static aggregateMovers(rows: Record<string, unknown>[], windowHours: number | null, limit: number): { wallet: string; buy: string; sell: string; trades: number }[] {
+        const since = windowHours === null ? null : new Date(Date.now() - windowHours * 3600_000).toISOString();
         const agg = new Map<string, { wallet: string; buy: Dec; sell: Dec; trades: number }>();
         for (const t of rows) {
             const at = t.eventAt ? String(t.eventAt) : null;
-            if (!at || at < since) continue;
+            if (!at) continue;
+            if (since !== null && at < since) continue;
             const wallet = String(t.wallet ?? '');
             if (!wallet) continue;
             const size = parseDec(t.size === null || t.size === undefined ? null : String(t.size));

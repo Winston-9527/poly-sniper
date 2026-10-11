@@ -127,6 +127,8 @@ export interface Config {
         marketBookEnrichPerCycle: number;
         /** 每个 token 保留多少条历史观察（只用于「和上一条比」，多了纯占盘） */
         marketObsKeepPerToken: number;
+        /** 「谁在动」按多长时间窗口聚合成交（长尾市场几小时才成交一次，默认 24h） */
+        marketMoverWindowHours: number;
     };
     push: {
         /** 0 或负数 = 不限量；仅在观察期这样用，正常上线要设回上限 */
@@ -216,6 +218,7 @@ export function loadConfig(): Config {
             marketMoverPullsPerCycle: envNum('MARKET_MOVER_PULLS_PER_CYCLE', 4),
             marketBookEnrichPerCycle: envNum('MARKET_BOOK_ENRICH_PER_CYCLE', 6),
             marketObsKeepPerToken: envNum('MARKET_OBS_KEEP_PER_TOKEN', 6),
+            marketMoverWindowHours: envNum('MARKET_MOVER_WINDOW_HOURS', 24),
         },
         push: {
             maxPerMinute: envLimit('MAX_ALERTS_PER_MIN', 6),

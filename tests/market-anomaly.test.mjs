@@ -152,7 +152,7 @@ test('谁在动：补一次成交流水后，报告里能看到具体钱包与�
     const first = await app.scanner.ensureTradesFor(CID);
     assert.equal(first.ok, true);
     assert.equal(first.rows, 2, '取到 2 笔成交');
-    const movers = app.scanner.recentMovers(CID, 3);
+    const movers = app.scanner.recentMovers(CID, 3).movers;
     assert.equal(movers.length, 2);
     assert.equal(movers[0].wallet, '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
     assert.equal(movers[0].buy, '6000', '20000 份 × 0.30 = $6000');
@@ -172,7 +172,7 @@ test('谁在动：补一次成交流水后，报告里能看到具体钱包与�
         ruleVersion: 'p1-rules-2', eventAt: '2026-10-09T10:05:00.000Z', observedAt: '2026-10-09T10:05:01.000Z',
     });
     const row = app.repos.db.get('SELECT * FROM market_anomalies WHERE id=?', rec.id);
-    const body = new Reports(app.repos, app.cfg).marketAnomalyReport(row, { movers: app.scanner.recentMovers(CID, 3) }).body;
+    const body = new Reports(app.repos, app.cfg).marketAnomalyReport(row, { movers: app.scanner.recentMovers(CID, 3).movers }).body;
     assert.match(body, /0xaaaaaaaa…/);
     assert.match(body, /🟢 <a href="https:\/\/polymarket\.com\/profile\/0xaaaaaaaa.*买 \$6,000（1 笔）/, '只有买入时只写买入（不写「/ 卖 $0」）');
 
@@ -184,7 +184,7 @@ test('谁在动：补一次成交流水后，报告里能看到具体钱包与�
         JSON.stringify({ tradeNotional: { p90: '12000', samples: 40 }, distinctMarketsInCoverage: 8, positionValueCovered: '340000', coverage: { earliestObservedActivity: '2025-06-01T00:00:00.000Z', reachedSourceStart: true, truncated: false } }),
         'p1-1', '2026-10-10T00:00:00.000Z',
     );
-    const withScore = new Reports(app.repos, app.cfg).marketAnomalyReport(row, { movers: app.scanner.recentMovers(CID, 3) }).body;
+    const withScore = new Reports(app.repos, app.cfg).marketAnomalyReport(row, { movers: app.scanner.recentMovers(CID, 3).movers }).body;
     assert.match(withScore, /🧭 画像 <b>\d+<\/b> 分（单笔规模 p90 \$12k｜专注度 8 个市场/, '采集过就要带画像分与明细');
     app.close();
 });
@@ -387,5 +387,37 @@ test('「谁在动」钱包插队采集：tier 1 且立即到期，排在普通�
     app.repos.watch(W, { marketConditionId: CID, source: 'market_anomaly_mover', tier: 1, nextCollectAt: null, reason: '谁在动' });
     const due = app.repos.dueWatch(new Date().toISOString(), 10).map((r) => String(r.address));
     assert.equal(due[0], W, '谁在动的钱包排在最前（下一轮就采集）');
+    app.close();
+});
+
+test('窗口内无成交时回退到「最近成交」，并在报告里写明口径（长尾市场几小时才成交一次）', async () => {
+    const old = Math.floor(Date.now() / 1000) - 30 * 3600;   // 30 小时前
+    const trades = [
+        { proxyWallet: '0xcccccccccccccccccccccccccccccccccccccccc', side: 'BUY', asset: TOKEN, conditionId: CID, size: 10000, price: 0.5, timestamp: old, transactionHash: '0xo1', outcome: 'Yes', outcomeIndex: 0 },
+    ];
+    const app = mkApp({ dataApiSpec: { trades } });
+    seedMarket(app.repos);
+    const r = await app.scanner.ensureTradesFor(CID, { freshMinutes: 0, windowHours: 24 });
+    assert.equal(r.ok, true);
+    const meta = app.scanner.recentMovers(CID, 3);
+    assert.equal(meta.fallback, true, '24h 窗口内没成交 → 回退');
+    assert.equal(meta.movers.length, 1);
+    assert.equal(meta.movers[0].buy, '5000', '10000 份 × 0.5 = $5000');
+    assert.ok(meta.newestTradeAt, '要记录最新一笔成交时间，供报告标注');
+
+    const rec = app.repos.insertMarketAnomaly({
+        dedupeKey: 'ma:fb:1', conditionId: CID, tokenId: TOKEN, outcome: 'Yes', kind: 'price_move',
+        windowMinutes: 5, priceBefore: '0.5', priceAfter: '0.55', delta: '0.05',
+        bestBid: '0.54', bestAsk: '0.56', spread: '0.02', volume24h: '50000', liquidity: '20000',
+        change1h: null, change24h: null, priority: 'medium', reason: 'r', dataQuality: 'verified',
+        ruleVersion: 'p1-rules-2', eventAt: '2026-10-11T06:00:00.000Z', observedAt: '2026-10-11T06:00:01.000Z',
+    });
+    const row = app.repos.db.get('SELECT * FROM market_anomalies WHERE id=?', rec.id);
+    const body = new Reports(app.repos, app.cfg).marketAnomalyReport(row, {
+        movers: meta.movers,
+        moverNote: `（24 小时内该市场没有新成交；以下是最接近窗口的最近成交，最新一笔在 ${meta.newestTradeAt}）`,
+    }).body;
+    assert.match(body, /24 小时内该市场没有新成交/, '必须写明「窗口内无成交」，不能让人以为是刚成交的');
+    assert.match(body, /买 \$5,000/);
     app.close();
 });

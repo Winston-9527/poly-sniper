@@ -64,7 +64,7 @@ async function main() {
     console.log(`\n可比对 token：${considered}（其中 ${insufficient} 个缺上一次观察/价格，无法判定）`);
     console.log(`异动命中：${hits.length} 条\n`);
     for (const h of hits.sort((a, b) => (a.row.priority === 'high' ? -1 : 1)).slice(0, top)) {
-        const movers = app.scanner.recentMovers(h.row.condition_id, 3);
+        const movers = app.scanner.recentMovers(h.row.condition_id, 3).movers;
         const rep = app.reports.marketAnomalyReport(h.row, { movers, shadow: !enqueue });
         console.log(`--- ${rep.title} ---`);
         console.log(rep.body.replace(/<\/?[^>]+>/g, ''));
