@@ -36,6 +36,7 @@ export interface CycleReport {
     marketScan: { observed: number; markets: number; stoppedBecause: string; excluded: Record<string, number> } | null;
     marketAnomalies: { created: number; enqueued: number; byKind: Record<string, number> };
     marketFollow: { checked: number; alerted: number; expired: number };
+    budget: { spent: number; limit: number; exhaustedSources: string[] };
     markets: string[];
     discovered: { market: string; added: number; skippedOverBudget: number; byEntry: Record<string, number> }[];
     processed: number;
@@ -62,6 +63,8 @@ export class LedgerPipeline {
     constructor(private deps: {
         repos: Repos; collector: Collector; config: Config; outbox: AlertOutbox;
         scanner?: MarketScanner;
+        /** 进程级请求预算（每轮会被重置；不传则不做预算记账，测试用） */
+        budget?: { spent: number; limit: number; exhaustedSources: Set<string> | string[]; reset?: () => void };
         log: (m: string) => void; now?: () => Date;
     }) {
         this.collector = deps.collector;
@@ -321,6 +324,8 @@ export class LedgerPipeline {
         const warnings: string[] = [];
         const cfg = this.deps.config;
         this.deps.outbox.recover();
+        // 每轮重置请求预算（进程级单例不重置会永久耗尽 → 市场扫描静默停摆）
+        this.deps.budget?.reset?.();
         this.cycleEnqueued = 0;
         this.cycleMarketEnqueued = 0;
         // ---- 首要信号：市场扫描与异动判定（先于钱包处理）----
@@ -369,7 +374,10 @@ export class LedgerPipeline {
         const flush = opts.flush === false ? null : await this.deps.outbox.flush();
         this.cycles++;
         this.lastCycleAt = nowIso();
-        return { startedAt: started, finishedAt: nowIso(), marketScan: market.scan, marketAnomalies: market.anomalies, marketFollow: follow, markets, discovered, processed, events, queued, suppressed, flush, warnings };
+        return { startedAt: started, finishedAt: nowIso(), marketScan: market.scan, marketAnomalies: market.anomalies, marketFollow: follow,
+            budget: this.deps.budget
+                ? { spent: this.deps.budget.spent, limit: this.deps.budget.limit, exhaustedSources: [...this.deps.budget.exhaustedSources] }
+                : { spent: 0, limit: 0, exhaustedSources: [] }, markets, discovered, processed, events, queued, suppressed, flush, warnings };
     }
 
     /**

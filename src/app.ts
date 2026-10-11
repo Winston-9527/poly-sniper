@@ -40,7 +40,7 @@ export function createApp(overrides: { config?: Partial<Config>; dbPath?: string
     const reports = new Reports(repos, config);
     const outbox = new AlertOutbox(repos, config, async () => ({ ok: false, error: '未接入发送器' }), log);
     const scanner = new MarketScanner({ repos, dataApi, http, config, budget, log });
-    const pipeline = new LedgerPipeline({ repos, collector, config, outbox, scanner, log, now: overrides.now });
+    const pipeline = new LedgerPipeline({ repos, collector, config, outbox, scanner, budget, log, now: overrides.now });
     const bot = new LedgerBot({ config, repos, reports, pipeline, outbox, dataApi, log });
     outbox.setSender(bot.sender);
     return {

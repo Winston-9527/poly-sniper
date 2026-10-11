@@ -528,3 +528,18 @@ test('跟踪基准价按 kind 取：成交量异动不能用「成交量」当�
     assert.equal(r.alerted, 0);
     app.close();
 });
+
+test('请求预算必须每轮重置：不重置会在跑满后让市场扫描永久静默停摆（曾经真的漏掉几小时异动）', async () => {
+    const app = mkApp({ config: { budgets: { requestsPerCycle: 3 } } });
+    const { RequestBudget } = await import('../dist/sources/http.js');
+    const budget = new RequestBudget(3);
+    const pipeline = new (Object.getPrototypeOf(app.pipeline).constructor)({ repos: app.repos, collector: app.collector, config: app.cfg, outbox: app.outbox, scanner: app.scanner, budget, log: () => { } });
+    // 先把预算用光
+    budget.trySpend('x'); budget.trySpend('x'); budget.trySpend('x');
+    assert.equal(budget.trySpend('x'), false, '用光后拒绝');
+    // 跑一轮：新轮开始时预算必须被重置（此前会一直是 3 → 永久耗尽 → 市场扫描静默停摆）
+    await pipeline.runCycle({ discovery: false });
+    assert.equal(budget.spent, 0, `新一轮开始时预算要归零（实际 ${budget.spent}）`);
+    assert.equal(budget.trySpend('y'), true, '重置后重新可用');
+    app.close();
+});

@@ -136,7 +136,7 @@ export function mkApp({ config = {}, dataApiSpec = {}, chainSpec = {}, httpHandl
         sentMessages.push({ chatId, body });
         return { ok: true, messageId: `m${sentMessages.length}` };
     }, () => { });
-    const pipeline = new LedgerPipeline({ repos, collector, config: cfg, outbox, scanner, log: () => { } });
+    const pipeline = new LedgerPipeline({ repos, collector, config: cfg, outbox, scanner, budget, log: () => { } });
     const reports = new Reports(repos, cfg);
     return { cfg, db, repos, budget, dataApi, chain, collector, scanner, http, outbox, pipeline, reports, sentMessages, setSenderMode: (m) => { senderMode = m; }, close: () => db.close() };
 }

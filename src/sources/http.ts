@@ -28,6 +28,12 @@ export class RequestBudget {
         this.used++;
         return true;
     }
+    /**
+     * 每轮开始重置。**必须**每轮调用：
+     * 这个对象是进程级单例，不重置的话它会累计到 requestsPerCycle 后永久耗尽，
+     * 之后每轮市场扫描都会静默停摆（日志只写「（budget）」）——实测就是这样漏掉了几小时的异动。
+     */
+    reset(): void { this.used = 0; this.exhaustedSources.clear(); }
     get spent(): number { return this.used; }
     get remaining(): number { return Math.max(0, this.limit - this.used); }
 }
