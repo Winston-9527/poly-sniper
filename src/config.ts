@@ -106,6 +106,8 @@ export interface Config {
         /** 成交量突增倍数 */
         marketVolumeSurge: number;
         marketVolumeSurgeHigh: number;
+        /** 「上一条 24h 成交量」的下限：太低说明是元数据刚回填，不算真放量 */
+        marketVolumeMinPrev: number;
         /** 最低 24h 成交量 / 流动性（过滤死市场） */
         marketMinVolume24h: number;
         marketMinLiquidity: number;
@@ -194,6 +196,7 @@ export function loadConfig(): Config {
             marketMinMidPrice: envNum('MARKET_MIN_MID_PRICE', 0.08),
             marketMinAbsSpread: envNum('MARKET_MIN_ABS_SPREAD', 0.02),
             marketVolumeSurge: envNum('MARKET_VOLUME_SURGE', 3),
+            marketVolumeMinPrev: envNum('MARKET_VOLUME_MIN_PREV', 500),
             marketVolumeSurgeHigh: envNum('MARKET_VOLUME_SURGE_HIGH', 8),
             marketMinVolume24h: envNum('MARKET_MIN_VOLUME_24H', 5000),
             marketMinLiquidity: envNum('MARKET_MIN_LIQUIDITY', 5000),

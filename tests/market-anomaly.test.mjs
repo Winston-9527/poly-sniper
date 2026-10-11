@@ -421,3 +421,13 @@ test('窗口内无成交时回退到「最近成交」，并在报告里写明�
     assert.match(body, /买 \$5,000/);
     app.close();
 });
+
+test('成交量突增：上一条成交量太低（元数据回填）不算放量（$12 → $57k 这种 4768 倍）', () => {
+    const prev = snap({ volume24h: parseDec('12') });
+    const cur = snap({ volume24h: parseDec('57122'), observedAt: '2026-10-11T06:00:00.000Z' });
+    assert.equal(detectAnomaly(prev, cur, RULES).candidates.some((c) => c.kind === 'volume_surge'), false, '$12 → $57k 是元数据回填，不报');
+
+    const prev2 = snap({ volume24h: parseDec('1200') });
+    const cur2 = snap({ volume24h: parseDec('9000'), observedAt: '2026-10-11T06:00:00.000Z' });
+    assert.equal(detectAnomaly(prev2, cur2, RULES).candidates.some((c) => c.kind === 'volume_surge'), true, '真放量（$1.2k → $9k，7.5 倍）照报');
+});

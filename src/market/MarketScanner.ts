@@ -51,6 +51,8 @@ export interface AnomalyRules {
     minAbsSpread: number;
     /** 成交量突增倍数 */
     volumeSurge: number;
+    /** 上一条 24h 成交量的最低值：低于这个数说明是元数据刚回填（$12 → $57k 这种 4768 倍不是真放量） */
+    volumeSurgeMinPrev: number;
     volumeSurgeHigh: number;
     /** 最低 24h 成交量（过滤死市场）与最低流动性 */
     minVolume24h: number;
@@ -86,6 +88,7 @@ export function anomalyRulesFromConfig(cfg: Config): AnomalyRules {
         minMidPrice: cfg.rules.marketMinMidPrice ?? 0.08,
         minAbsSpread: cfg.rules.marketMinAbsSpread ?? 0.02,
         volumeSurge: cfg.rules.marketVolumeSurge ?? 3,
+        volumeSurgeMinPrev: cfg.rules.marketVolumeMinPrev ?? 500,
         volumeSurgeHigh: cfg.rules.marketVolumeSurgeHigh ?? 8,
         minVolume24h: cfg.rules.marketMinVolume24h ?? 5000,
         minLiquidity: cfg.rules.marketMinLiquidity ?? 5000,
@@ -156,7 +159,8 @@ export function detectAnomaly(prev: MarketSnapshot | null, cur: MarketSnapshot, 
         const pv = decToNumber(prev.volume24h)!, cv = decToNumber(cur.volume24h)!;
         if (pv > 0) {
             const mult = cv / pv;
-            if (mult >= rules.volumeSurge && cv >= rules.minVolume24h) {
+            // pv 太小（例如 $12）说明上一条是元数据没回填好的观察，不是「成交量突然放大 4768 倍」
+            if (mult >= rules.volumeSurge && cv >= rules.minVolume24h && pv >= (rules.volumeSurgeMinPrev ?? 500)) {
                 out.push({
                     conditionId: cur.conditionId, tokenId: cur.tokenId, outcome: cur.outcome, kind: 'volume_surge', windowMinutes,
                     priceBefore: prev.volume24h, priceAfter: cur.volume24h, delta: null,
