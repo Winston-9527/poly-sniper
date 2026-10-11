@@ -1,0 +1,428 @@
+{
+  "generatedAt": "2026-10-09T08:44:42.362Z",
+  "proxy": "set",
+  "checks": [
+    {
+      "name": "gamma_market",
+      "slug": "nobel-peace-prize-winner-2026-139",
+      "httpStatus": 200,
+      "ms": 98,
+      "fields": 91,
+      "hasClobTokenIds": true
+    },
+    {
+      "name": "holders_limit_20",
+      "httpStatus": 200,
+      "ms": 473,
+      "groups": 2,
+      "groupKeys": [
+        "holders",
+        "token"
+      ],
+      "returned": 20,
+      "holderKeys": [
+        "amount",
+        "asset",
+        "bio",
+        "displayUsernamePublic",
+        "name",
+        "outcomeIndex",
+        "profileImage",
+        "profileImageOptimized",
+        "proxyWallet",
+        "pseudonym",
+        "verified"
+      ]
+    },
+    {
+      "name": "holders_limit_100",
+      "httpStatus": 200,
+      "ms": 110,
+      "groups": 2,
+      "groupKeys": [
+        "holders",
+        "token"
+      ],
+      "returned": 100,
+      "holderKeys": [
+        "amount",
+        "asset",
+        "bio",
+        "displayUsernamePublic",
+        "name",
+        "outcomeIndex",
+        "profileImage",
+        "profileImageOptimized",
+        "proxyWallet",
+        "pseudonym",
+        "verified"
+      ]
+    },
+    {
+      "name": "holders_limit_500",
+      "httpStatus": 200,
+      "ms": 367,
+      "groups": 2,
+      "groupKeys": [
+        "holders",
+        "token"
+      ],
+      "returned": 500,
+      "holderKeys": [
+        "amount",
+        "asset",
+        "bio",
+        "displayUsernamePublic",
+        "name",
+        "outcomeIndex",
+        "profileImage",
+        "profileImageOptimized",
+        "proxyWallet",
+        "pseudonym",
+        "verified"
+      ]
+    },
+    {
+      "name": "trades_page0",
+      "httpStatus": 200,
+      "ms": 187,
+      "n": 500,
+      "fields": [
+        "asset",
+        "bio",
+        "conditionId",
+        "eventSlug",
+        "icon",
+        "name",
+        "outcome",
+        "outcomeIndex",
+        "price",
+        "profileImage",
+        "profileImageOptimized",
+        "proxyWallet",
+        "pseudonym",
+        "side",
+        "size",
+        "slug",
+        "timestamp",
+        "title",
+        "transactionHash"
+      ],
+      "sample": {
+        "proxyWallet": "0x910dB0C46a482bAdF2D77eE2933612739f971530",
+        "side": "BUY",
+        "asset": "96308556109755835434254900303426519652053230974356832970824534225192181988516",
+        "conditionId": "0xa6448a91aa8d5df6d31625f7b4099c64ef163ecd332963825d7d2a9331f61ad0",
+        "size": 500,
+        "price": 0.002,
+        "timestamp": 1791535033,
+        "title": "Will Donald Trump win the Nobel Peace Prize in 2026?",
+        "slug": "will-donald-trump-win-the-nobel-peace-prize-in-2026-382",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/will-donald-trump-win-the-nobel-peace-prize-in-2025-qey6H5SNKnXF.jpg",
+        "eventSlug": "nobel-peace-prize-winner-2026-139",
+        "outcome": "Yes",
+        "outcomeIndex": 0,
+        "name": "«user-481»",
+        "pseudonym": "«user-482»",
+        "bio": "",
+        "profileImage": "",
+        "profileImageOptimized": "",
+        "transactionHash": "0xb93753ddb20a3b529fda6e23afa1bf2002da50d95c6cba9eef5bc97ff8b3ad4c"
+      }
+    },
+    {
+      "name": "trades_pagination",
+      "pages": [
+        {
+          "offset": 0,
+          "status": 200,
+          "n": 500
+        },
+        {
+          "offset": 500,
+          "status": 200,
+          "n": 500
+        },
+        {
+          "offset": 1000,
+          "status": 200,
+          "n": 500
+        },
+        {
+          "offset": 2500,
+          "status": 200,
+          "n": 500
+        },
+        {
+          "offset": 3000,
+          "status": 200,
+          "n": 500
+        }
+      ],
+      "uniqueWallets": 747,
+      "uniqueTx": 2496
+    },
+    {
+      "name": "activity_ASC",
+      "httpStatus": 200,
+      "ms": 1036,
+      "n": 500,
+      "types": {
+        "TRADE": 453,
+        "YIELD": 36,
+        "TAKER_REBATE": 11
+      },
+      "fields": [
+        "asset",
+        "bio",
+        "conditionId",
+        "eventSlug",
+        "icon",
+        "name",
+        "outcome",
+        "outcomeIndex",
+        "price",
+        "profileImage",
+        "profileImageOptimized",
+        "proxyWallet",
+        "pseudonym",
+        "side",
+        "size",
+        "slug",
+        "timestamp",
+        "title",
+        "transactionHash",
+        "type",
+        "usdcSize"
+      ]
+    },
+    {
+      "name": "activity_DESC",
+      "httpStatus": 200,
+      "ms": 507,
+      "n": 500,
+      "types": {
+        "TRADE": 485,
+        "YIELD": 11,
+        "TAKER_REBATE": 4
+      },
+      "fields": [
+        "asset",
+        "bio",
+        "conditionId",
+        "eventSlug",
+        "icon",
+        "name",
+        "outcome",
+        "outcomeIndex",
+        "price",
+        "profileImage",
+        "profileImageOptimized",
+        "proxyWallet",
+        "pseudonym",
+        "side",
+        "size",
+        "slug",
+        "timestamp",
+        "title",
+        "transactionHash",
+        "type",
+        "usdcSize"
+      ]
+    },
+    {
+      "name": "positions",
+      "httpStatus": 200,
+      "ms": 335,
+      "n": 12,
+      "fields": [
+        "asset",
+        "avgPrice",
+        "cashPnl",
+        "conditionId",
+        "curPrice",
+        "currentValue",
+        "endDate",
+        "entryFeesUsdc",
+        "eventId",
+        "eventSlug",
+        "grossInitialValue",
+        "icon",
+        "initialValue",
+        "mergeable",
+        "negativeRisk",
+        "oppositeAsset",
+        "oppositeOutcome",
+        "outcome",
+        "outcomeIndex",
+        "percentPnl",
+        "percentRealizedPnl",
+        "proxyWallet",
+        "realizedPnl",
+        "redeemable",
+        "size",
+        "slug",
+        "title",
+        "totalBought"
+      ],
+      "sample": {
+        "proxyWallet": "0x58A3Be30EaCaCaA969CdF82e6fE4DfCf09Be8d5c",
+        "asset": "109876868437950584369987384406356259939519193117253465815665152916226511121427",
+        "conditionId": "0x5c8b8b8ee9c3dfafa6e7bfbcb4801b457f38d29a7878c7cb2a4f1ba82a0c26c1",
+        "size": 158386.9956,
+        "avgPrice": 0.3508,
+        "initialValue": 55574.6465,
+        "grossInitialValue": 57003.479748,
+        "entryFeesUsdc": 1428.83322,
+        "currentValue": 136846.3642,
+        "cashPnl": 81271.7176,
+        "percentPnl": 146.2388,
+        "totalBought": 158386.9956,
+        "realizedPnl": 0,
+        "percentRealizedPnl": 146.2388,
+        "curPrice": 0.864,
+        "redeemable": false,
+        "mergeable": false,
+        "title": "Will Flávio Bolsonaro win the 2026 Brazilian presidential election?",
+        "slug": "will-flvio-bolsonaro-win-the-2026-brazilian-presidential-election",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/will-flvio-bolsonaro-win-the-2026-brazilian-presidential-election-LUNiqIvy01pf.jpg",
+        "eventId": "45915",
+        "eventSlug": "brazil-presidential-election",
+        "outcome": "Yes",
+        "outcomeIndex": 0,
+        "oppositeOutcome": "No",
+        "oppositeAsset": "38310927461258927563020508025396887688249787380193911540547071417200646834355",
+        "endDate": "2026-10-05",
+        "negativeRisk": true
+      }
+    },
+    {
+      "name": "value",
+      "httpStatus": 200,
+      "ms": 326,
+      "body": [
+        {
+          "user": "0x58A3Be30EaCaCaA969CdF82e6fE4DfCf09Be8d5c",
+          "value": 156512.9842
+        }
+      ]
+    },
+    {
+      "name": "chain_owner_probe",
+      "n": 8,
+      "sample": [
+        {
+          "codeLen": 146,
+          "owner": {
+            "addr": "0x4b0c7888ca22afaa2a0e94e0dfd43f4e5379bb7b"
+          },
+          "getOwners": {
+            "unsupported": "execution reverted"
+          },
+          "threshold": {
+            "unsupported": "execution reverted"
+          }
+        },
+        {
+          "codeLen": 45,
+          "owner": {
+            "unsupported": "execution reverted"
+          },
+          "getOwners": {
+            "unsupported": "execution reverted"
+          },
+          "threshold": {
+            "unsupported": "execution reverted"
+          }
+        },
+        {
+          "codeLen": 146,
+          "owner": {
+            "addr": "0x2a5435d417af16d68d1a596ebe5ca3e628ef9a3d"
+          },
+          "getOwners": {
+            "unsupported": "execution reverted"
+          },
+          "threshold": {
+            "unsupported": "execution reverted"
+          }
+        },
+        {
+          "codeLen": 124,
+          "owner": {
+            "unsupported": "execution reverted"
+          },
+          "getOwners": {
+            "n": 3,
+            "addresses": 3
+          },
+          "threshold": {
+            "value": 1
+          }
+        },
+        {
+          "codeLen": 124,
+          "owner": {
+            "unsupported": "execution reverted"
+          },
+          "getOwners": {
+            "n": 3,
+            "addresses": 3
+          },
+          "threshold": {
+            "value": 1
+          }
+        },
+        {
+          "codeLen": 124,
+          "owner": {
+            "unsupported": "execution reverted"
+          },
+          "getOwners": {
+            "n": 3,
+            "addresses": 3
+          },
+          "threshold": {
+            "value": 1
+          }
+        },
+        {
+          "codeLen": 45,
+          "owner": {
+            "unsupported": "execution reverted"
+          },
+          "getOwners": {
+            "unsupported": "execution reverted"
+          },
+          "threshold": {
+            "unsupported": "execution reverted"
+          }
+        },
+        {
+          "codeLen": 45,
+          "owner": {
+            "unsupported": "execution reverted"
+          },
+          "getOwners": {
+            "unsupported": "execution reverted"
+          },
+          "threshold": {
+            "unsupported": "execution reverted"
+          }
+        }
+      ]
+    },
+    {
+      "name": "usdc_getLogs",
+      "ok": false,
+      "n": 0,
+      "error": "Archive requests require a personal token. Get one at: https://www.allnodes.com/publicnode"
+    },
+    {
+      "name": "trades_limit_cap",
+      "requested": 1000,
+      "returned": 1000,
+      "httpStatus": 200
+    }
+  ]
+}
