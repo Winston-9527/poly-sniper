@@ -12,7 +12,8 @@ import { Reports, BehaviorRow, MarketAnomalyRow } from '../report/Reports.js';
 import { buildBehavior, ChangeForBehavior, PriorityRules, isReactivation } from './Behaviors.js';
 import { MarketScanner, MarketSnapshot, AnomalyCandidate, AnomalyRules, detectAnomaly, anomalyRulesFromConfig } from '../market/MarketScanner.js';
 import { GammaMarket } from '../sources/contracts.js';
-import { decToString, fromDb, parseDec, mul, div, decToNumber, Dec, ZERO } from '../util/decimal.js';
+import { decToString, fromDb, parseDec, mul, div, decToNumber, add as addDec, sub as subDec, Dec, ZERO } from '../util/decimal.js';
+import { fmtQty } from '../util/format.js';
 import { nowIso, toDisplay } from '../util/time.js';
 
 export interface ProcessResult {
@@ -34,6 +35,7 @@ export interface CycleReport {
     /** 市场扫描（首要信号） */
     marketScan: { observed: number; markets: number; stoppedBecause: string; excluded: Record<string, number> } | null;
     marketAnomalies: { created: number; enqueued: number; byKind: Record<string, number> };
+    marketFollow: { checked: number; alerted: number; expired: number };
     markets: string[];
     discovered: { market: string; added: number; skippedOverBudget: number; byEntry: Record<string, number> }[];
     processed: number;
@@ -323,6 +325,8 @@ export class LedgerPipeline {
         this.cycleMarketEnqueued = 0;
         // ---- 首要信号：市场扫描与异动判定（先于钱包处理）----
         const market = await this.runMarketScan();
+        // 第一步：异动出现后必须能高效追踪 —— 每轮复查到期的跟踪市场（只有继续同向发展才再推）
+        const follow = await this.followDueMarkets();
         const discovered: CycleReport['discovered'] = [];
         const markets: string[] = [...(opts.markets ?? [])];
         for (const m of this.repos.listWatchedMarkets()) {
@@ -365,7 +369,7 @@ export class LedgerPipeline {
         const flush = opts.flush === false ? null : await this.deps.outbox.flush();
         this.cycles++;
         this.lastCycleAt = nowIso();
-        return { startedAt: started, finishedAt: nowIso(), marketScan: market.scan, marketAnomalies: market.anomalies, markets, discovered, processed, events, queued, suppressed, flush, warnings };
+        return { startedAt: started, finishedAt: nowIso(), marketScan: market.scan, marketAnomalies: market.anomalies, marketFollow: follow, markets, discovered, processed, events, queued, suppressed, flush, warnings };
     }
 
     /**
@@ -449,9 +453,17 @@ export class LedgerPipeline {
             }
             const mvMeta = this.deps.scanner.recentMovers(cand.conditionId, 3);
             const movers = mvMeta.movers;
-            const moverNote = mvMeta.fallback
-                ? `（${mvMeta.windowHours ?? 24} 小时内该市场没有新成交；以下是最接近窗口的最近成交${mvMeta.newestTradeAt ? `，最新一笔在 ${toDisplay(mvMeta.newestTradeAt)}` : ''}）`
-                : '（该市场最近已获取的成交，非全市场）';
+            // 三件事必须分开说（长尾市场最常见的是第一种，那是事实不是缺口）：
+            //   1) 拉到了流水但没有任何成交 → 「最近没有成交」（长尾市场正常）
+            //   2) 拉到了流水，只是窗口内没有 → 回退说明 + 最新成交时间
+            //   3) 根本没拉到（失败/预算）→ 明确说这是缺口
+            const moverNote = !mvMeta.fetched
+                ? '（未取到该市场的成交流水：这是缺口，不是「没人交易」）'
+                : mvMeta.rows === 0
+                    ? '（该市场最近没有成交——来源返回空，属事实；长尾市场常这样）'
+                    : mvMeta.fallback
+                        ? `（${mvMeta.windowHours ?? 24} 小时内该市场没有新成交；以下是最接近窗口的最近成交${mvMeta.newestTradeAt ? `，最新一笔在 ${toDisplay(mvMeta.newestTradeAt)}` : ''}）`
+                        : '（该市场最近已获取的成交，非全市场）';
             // 「谁在动」的钱包顺带纳入关注名单：下一轮起就会采集它们的活动/持仓，
             // 之后同一条异动的「谁在动」里就能带出画像分（而不是永远显示未采集）。
             for (const mv of movers) {
@@ -462,7 +474,34 @@ export class LedgerPipeline {
                     reason: `市场异动「谁在动」：${cand.kind}（本市场最近 ${mv.trades} 笔，买 $${mv.buy} / 卖 $${mv.sell}）`,
                 });
             }
-            const rep = this.reports.marketAnomalyReport(row as unknown as MarketAnomalyRow, { movers, moverNote, shadow: cfg.shadowMode });
+            // 第一步（用户明确要求）：异动出现就必须能被高效追踪 —— 登记跟踪队列，
+            // 之后每 MARKET_FOLLOW_INTERVAL_MIN 复查盘口/成交，只有「继续同向发展」才再推。
+            const st = this.deps.config.rules;
+            // 基准价：价格异动用异动价；其余（盘口/成交量）用「异动时刻该市场的最近一次观察价」，
+            // 因为这两种异动的 price_before/after 存的不是价格（盘口是买一、成交量是金额）。
+            const kind = String(row.kind);
+            let basePrice: string | null = kind === 'price_move' ? (row.price_after ?? row.price_before ?? null) : null;
+            if (basePrice === null) {
+                const near = this.repos.db.get<{ price: string | null }>(
+                    `SELECT price FROM market_observations WHERE condition_id=? AND price IS NOT NULL AND observed_at <= ? ORDER BY observed_at DESC LIMIT 1`,
+                    cand.conditionId, String(row.observed_at),
+                );
+                basePrice = near?.price ?? null;
+            }
+            // 价格异动方向明确；盘口/成交量的异动当时没记价格方向 → 任一方向的大幅变化都算「有进展」
+            const direction = kind === 'price_move' ? (Number(row.delta ?? 0) >= 0 ? 'up' : 'down') : 'either';
+            const nowMs = Date.now();
+            let followNote: string | undefined;
+            if (basePrice !== null && st.marketFollowHours > 0) {
+                this.repos.addFollowup({
+                    conditionId: cand.conditionId, tokenId: cand.tokenId, anomalyId: Number(row.id),
+                    kind: String(row.kind), direction, basePrice: String(basePrice),
+                    nextCheckAt: new Date(nowMs + st.marketFollowIntervalMin * 60_000).toISOString(),
+                    followUntil: new Date(nowMs + st.marketFollowHours * 3600_000).toISOString(),
+                });
+                followNote = `已加入跟踪：每 ${st.marketFollowIntervalMin} 分钟复查盘口与成交，跟踪 ${st.marketFollowHours} 小时；只有${direction === 'either' ? '价格再变化' : `继续${direction === 'up' ? '上涨' : '下跌'}`} ${(st.marketFollowMove * 100).toFixed(0)} 个点以上才会再推。`;
+            }
+            const rep = this.reports.marketAnomalyReport(row as unknown as MarketAnomalyRow, { movers, moverNote, showMoverHeader: mvMeta.fetched, followNote, shadow: cfg.shadowMode });
             const enq = this.deps.outbox.enqueue(`alert:${cand.dedupeKey}`, {
                 chatId: cfg.telegram.chatIds[0] ?? '', title: rep.title, body: rep.body,
                 wallet: '', conditionId: cand.conditionId, priority: cand.priority, dataQuality: cand.dataQuality,
@@ -470,6 +509,89 @@ export class LedgerPipeline {
             if (enq.inserted) { result.enqueued++; this.cycleMarketEnqueued++; }
         }
         return { scan: { observed: scan.observed, markets: scan.markets, stoppedBecause: scan.stoppedBecause, excluded: scan.excluded }, anomalies: result };
+    }
+
+    /**
+     * 异动跟踪复查（第一步：保证异动出现后能高效追踪）。
+     * 对到期的跟踪市场：补盘口（CLOB 双边）+ 补成交流水（10 分钟内不重复拉），
+     * 记录一条观察，然后判断「是否继续同向发展」——只有够门槛才再推一条，避免长尾市场刷屏。
+     */
+    async followDueMarkets(): Promise<{ checked: number; alerted: number; expired: number }> {
+        const cfg = this.deps.config;
+        const st = cfg.rules;
+        const scanner = this.deps.scanner;
+        const out = { checked: 0, alerted: 0, expired: 0 };
+        if (!scanner || st.marketFollowHours <= 0) return out;
+        const now = nowIso();
+        out.expired = this.repos.expireFollowups(now);
+        const due = this.repos.dueFollowups(now, Math.max(0, st.marketFollowMaxPerCycle));
+        for (const f of due) {
+            const cid = String(f.condition_id);
+            const tokenId = f.token_id === null || f.token_id === undefined ? null : String(f.token_id);
+            out.checked++;
+            let mid: Dec | null = null;
+            let bestBid: string | null = null, bestAsk: string | null = null, spread: string | null = null;
+            if (tokenId) {
+                const book = await scanner.enrichBook(tokenId);
+                if (book.ok && book.bestBid && book.bestAsk) {
+                    bestBid = book.bestBid; bestAsk = book.bestAsk; spread = book.spread;
+                    mid = div(addDec(parseDec(book.bestBid)!, parseDec(book.bestAsk)!), parseDec('2'));
+                } else if (!book.ok) {
+                    this.repos.addGap('market', cid, 'query_failed', `跟踪复查盘口失败：${book.error}`);
+                }
+            }
+            await scanner.ensureTradesFor(cid);
+            const meta = scanner.recentMovers(cid, 3);
+            const obs = this.repos.latestMarketObservation(cid);
+            const observedAt = nowIso();
+            if (mid !== null) {
+                this.repos.insertMarketObservation({
+                    conditionId: cid, tokenId, outcome: null, price: decToString(mid),
+                    bestBid, bestAsk, spread, lastTradePrice: null, change1h: null, change24h: null,
+                    volume24h: obs?.volume_24h ?? null, liquidity: obs?.liquidity ?? null, observedAt,
+                });
+            }
+            const base = f.base_price === null || f.base_price === undefined ? null : parseDec(String(f.base_price));
+            const direction = String(f.direction);
+            const delta = base !== null && mid !== null ? decToString(subDec(mid, base)) : null;
+            const deltaNum = delta === null ? null : Number(delta);
+            const sameWay = deltaNum !== null && (direction === 'either' ? true : ((direction === 'up' && deltaNum > 0) || (direction === 'down' && deltaNum < 0)));
+            const material = deltaNum !== null && Math.abs(deltaNum) >= st.marketFollowMove;
+            let alerted = false;
+            if (sameWay && material && mid !== null) {
+                const bucket = Math.floor(Date.now() / (st.marketFollowCooldownMin * 60_000));
+                const minutes = Math.max(1, Math.round((Date.now() - Date.parse(String(f.created_at))) / 60_000));
+                const fa = {
+                    id: Number(f.id), condition_id: cid, token_id: tokenId, outcome: null, kind: 'follow_up',
+                    window_minutes: minutes, price_before: String(f.base_price), price_after: decToString(mid), delta,
+                    best_bid: bestBid, best_ask: bestAsk, spread,
+                    volume_24h: obs?.volume_24h ?? null, liquidity: obs?.liquidity ?? null, change_1h: null, change_24h: null,
+                    priority: 'high', data_quality: 'verified', rule_version: RULES_VERSION,
+                    event_at: observedAt, observed_at: observedAt,
+                    reason: `首次为「${Reports.ANOMALY_LABEL[String(f.kind)] ?? String(f.kind)}」；跟踪 ${minutes} 分钟后价格${direction === 'either' ? '变化' : '继续同向'}：${fmtQty(String(f.base_price))} → ${decToString(mid)}（${(deltaNum! * 100).toFixed(1)} 个点，阈值 ${(st.marketFollowMove * 100).toFixed(0)}）`,
+                };
+                const rep = this.reports.marketAnomalyReport(fa as unknown as MarketAnomalyRow, {
+                    movers: meta.movers, showMoverHeader: meta.fetched,
+                    moverNote: !meta.fetched ? '（未取到该市场的成交流水：这是缺口，不是「没人交易」）'
+                        : meta.rows === 0 ? '（该市场最近没有成交——来源返回空，属事实；长尾市场常这样）'
+                            : '（该市场最近已获取的成交，非全市场）',
+                    shadow: cfg.shadowMode,
+                });
+                const enq = this.deps.outbox.enqueue(`follow:${cid}:${bucket}`, {
+                    chatId: cfg.telegram.chatIds[0] ?? '', title: rep.title, body: rep.body,
+                    wallet: '', conditionId: cid, priority: 'high', dataQuality: 'verified',
+                });
+                if (enq.inserted) { out.alerted++; alerted = true; }
+            }
+            this.repos.updateFollowup(Number(f.id), {
+                lastPrice: mid === null ? null : decToString(mid), lastCheckAt: observedAt,
+                checks: Number(f.checks) + 1, nextCheckAt: new Date(Date.now() + st.marketFollowIntervalMin * 60_000).toISOString(),
+            });
+            if (!alerted && deltaNum !== null) {
+                this.deps.log(`[follow] ${cid.slice(0, 12)}… 复查：${decToString(mid)}（相对首次 ${(deltaNum * 100).toFixed(1)} 个点，未达推送门槛）`);
+            }
+        }
+        return out;
     }
 
     stats(): { cycles: number; lastCycleAt: string | null } { return { cycles: this.cycles, lastCycleAt: this.lastCycleAt }; }

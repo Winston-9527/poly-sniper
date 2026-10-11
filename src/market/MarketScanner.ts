@@ -53,6 +53,8 @@ export interface AnomalyRules {
     volumeSurge: number;
     /** 上一条 24h 成交量的最低值：低于这个数说明是元数据刚回填（$12 → $57k 这种 4768 倍不是真放量） */
     volumeSurgeMinPrev: number;
+    /** 放量的绝对增量下限：长尾市场靠「增量够看头」而不是「绝对成交量大」来判定 */
+    volumeDeltaMin: number;
     volumeSurgeHigh: number;
     /** 最低 24h 成交量（过滤死市场）与最低流动性 */
     minVolume24h: number;
@@ -89,6 +91,7 @@ export function anomalyRulesFromConfig(cfg: Config): AnomalyRules {
         minAbsSpread: cfg.rules.marketMinAbsSpread ?? 0.02,
         volumeSurge: cfg.rules.marketVolumeSurge ?? 3,
         volumeSurgeMinPrev: cfg.rules.marketVolumeMinPrev ?? 500,
+        volumeDeltaMin: cfg.rules.marketVolumeDeltaMin ?? 1000,
         volumeSurgeHigh: cfg.rules.marketVolumeSurgeHigh ?? 8,
         minVolume24h: cfg.rules.marketMinVolume24h ?? 5000,
         minLiquidity: cfg.rules.marketMinLiquidity ?? 5000,
@@ -155,12 +158,16 @@ export function detectAnomaly(prev: MarketSnapshot | null, cur: MarketSnapshot, 
     }
 
     // ---- 成交量突增 ----
+    // 长尾市场一天也没有几次成交：这里不用「绝对成交量 $X」当门槛（那会把长尾全挡掉），
+    // 改成「相对自身基线放大 N 倍 + 绝对增量 ≥ volumeDeltaMin + 盘口有深度」。
     if (prev.volume24h !== null && cur.volume24h !== null) {
         const pv = decToNumber(prev.volume24h)!, cv = decToNumber(cur.volume24h)!;
+        const liq = cur.liquidity === null ? null : decToNumber(cur.liquidity)!;
+        const liqOk = liq === null || liq >= rules.minLiquidity;
         if (pv > 0) {
             const mult = cv / pv;
             // pv 太小（例如 $12）说明上一条是元数据没回填好的观察，不是「成交量突然放大 4768 倍」
-            if (mult >= rules.volumeSurge && cv >= rules.minVolume24h && pv >= (rules.volumeSurgeMinPrev ?? 500)) {
+            if (mult >= rules.volumeSurge && (cv - pv) >= (rules.volumeDeltaMin ?? 1000) && pv >= (rules.volumeSurgeMinPrev ?? 500) && liqOk) {
                 out.push({
                     conditionId: cur.conditionId, tokenId: cur.tokenId, outcome: cur.outcome, kind: 'volume_surge', windowMinutes,
                     priceBefore: prev.volume24h, priceAfter: cur.volume24h, delta: null,
@@ -348,21 +355,23 @@ export class MarketScanner {
      * 「谁在动」：从最近落库的成交流水里取该市场窗口内成交额最大的几个钱包。
      * 只报告已获取到的页，并注明口径（不宣称全市场）。
      */
-    recentMovers(conditionId: string, limit = 3): { movers: { wallet: string; buy: string; sell: string; trades: number }[]; windowHours: number | null; fallback: boolean; newestTradeAt: string | null } {
+    recentMovers(conditionId: string, limit = 3): { movers: { wallet: string; buy: string; sell: string; trades: number }[]; windowHours: number | null; fallback: boolean; newestTradeAt: string | null; rows: number | null; fetched: boolean } {
         const row = this.repos.db.get<{ payload: string }>(
             `SELECT payload FROM source_records WHERE source='derived/movers' AND market_condition_id=? ORDER BY id DESC LIMIT 1`,
             conditionId,
         );
-        const empty = { movers: [], windowHours: null as number | null, fallback: false, newestTradeAt: null as string | null };
+        const empty = { movers: [], windowHours: null as number | null, fallback: false, newestTradeAt: null as string | null, rows: null as number | null, fetched: false };
         if (!row) return empty;
         try {
-            const parsed = JSON.parse(row.payload) as { movers?: unknown; windowHours?: number; fallback?: boolean; newestTradeAt?: string | null };
+            const parsed = JSON.parse(row.payload) as { movers?: unknown; windowHours?: number; fallback?: boolean; newestTradeAt?: string | null; rows?: number };
             const arr = Array.isArray(parsed.movers) ? parsed.movers as { wallet: string; buy: string; sell: string; trades: number }[] : [];
             return {
                 movers: arr.slice(0, limit),
                 windowHours: parsed.windowHours ?? null,
                 fallback: parsed.fallback === true,
                 newestTradeAt: parsed.newestTradeAt ?? null,
+                rows: typeof parsed.rows === 'number' ? parsed.rows : null,
+                fetched: true,
             };
         } catch { return empty; }
     }

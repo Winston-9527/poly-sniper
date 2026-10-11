@@ -196,6 +196,27 @@ CREATE TABLE IF NOT EXISTS profile_versions (
   UNIQUE(wallet, as_of, algorithm_version)
 );
 
+-- 异动跟踪（第一步：异动出现后必须能高效追踪该市场）
+-- 异动报警会往这里写一条：跟踪窗口内周期性复查盘口/成交，只有「继续同向发展」才再推一条。
+CREATE TABLE IF NOT EXISTS market_followups (
+  id            INTEGER PRIMARY KEY,
+  condition_id  TEXT NOT NULL,
+  token_id      TEXT,
+  anomaly_id    INTEGER NOT NULL,
+  kind          TEXT NOT NULL,
+  direction     TEXT NOT NULL,              -- up / down（首次异动的方向）
+  base_price    TEXT,                       -- 首次异动时的价格（比较基准）
+  created_at    TEXT NOT NULL,
+  next_check_at TEXT NOT NULL,
+  follow_until  TEXT NOT NULL,
+  checks        INTEGER NOT NULL DEFAULT 0,
+  last_price    TEXT,
+  last_check_at TEXT,
+  state         TEXT NOT NULL DEFAULT 'active',   -- active / expired
+  UNIQUE(condition_id, anomaly_id)
+);
+CREATE INDEX IF NOT EXISTS idx_followups_due ON market_followups(state, next_check_at);
+
 -- 行为事件与报警队列
 CREATE TABLE IF NOT EXISTS behavior_events (
   id                INTEGER PRIMARY KEY,

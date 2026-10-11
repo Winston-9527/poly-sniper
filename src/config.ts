@@ -108,6 +108,8 @@ export interface Config {
         marketVolumeSurgeHigh: number;
         /** 「上一条 24h 成交量」的下限：太低说明是元数据刚回填，不算真放量 */
         marketVolumeMinPrev: number;
+        /** 放量的绝对增量下限（长尾市场：不要求绝对成交量高，但增量要够看头） */
+        marketVolumeDeltaMin: number;
         /** 最低 24h 成交量 / 流动性（过滤死市场） */
         marketMinVolume24h: number;
         marketMinLiquidity: number;
@@ -131,6 +133,14 @@ export interface Config {
         marketObsKeepPerToken: number;
         /** 「谁在动」按多长时间窗口聚合成交（长尾市场几小时才成交一次，默认 24h） */
         marketMoverWindowHours: number;
+        /** 异动跟踪：跟踪窗口（小时）、复查间隔（分钟）、每轮最多复查几个市场 */
+        marketFollowHours: number;
+        marketFollowIntervalMin: number;
+        marketFollowMaxPerCycle: number;
+        /** 跟踪中再次推送的门槛：相对首次异动继续同向走这么多（0.05 = 5 个点） */
+        marketFollowMove: number;
+        /** 同一市场的跟踪推送冷却（分钟），避免长尾市场反复推送 */
+        marketFollowCooldownMin: number;
     };
     push: {
         /** 0 或负数 = 不限量；仅在观察期这样用，正常上线要设回上限 */
@@ -197,9 +207,10 @@ export function loadConfig(): Config {
             marketMinAbsSpread: envNum('MARKET_MIN_ABS_SPREAD', 0.02),
             marketVolumeSurge: envNum('MARKET_VOLUME_SURGE', 3),
             marketVolumeMinPrev: envNum('MARKET_VOLUME_MIN_PREV', 500),
+            marketVolumeDeltaMin: envNum('MARKET_VOLUME_DELTA_MIN', 1000),
             marketVolumeSurgeHigh: envNum('MARKET_VOLUME_SURGE_HIGH', 8),
-            marketMinVolume24h: envNum('MARKET_MIN_VOLUME_24H', 5000),
-            marketMinLiquidity: envNum('MARKET_MIN_LIQUIDITY', 5000),
+            marketMinVolume24h: envNum('MARKET_MIN_VOLUME_24H', 200),
+            marketMinLiquidity: envNum('MARKET_MIN_LIQUIDITY', 1000),
             marketScanPages: envNum('MARKET_SCAN_PAGES', 5),
             marketScanOrders: envList('MARKET_SCAN_ORDERS', ['volume24hr', 'liquidity']),
             marketMinHoursToEnd: envNum('MARKET_MIN_HOURS_TO_END', 24),
@@ -222,6 +233,11 @@ export function loadConfig(): Config {
             marketBookEnrichPerCycle: envNum('MARKET_BOOK_ENRICH_PER_CYCLE', 6),
             marketObsKeepPerToken: envNum('MARKET_OBS_KEEP_PER_TOKEN', 6),
             marketMoverWindowHours: envNum('MARKET_MOVER_WINDOW_HOURS', 24),
+            marketFollowHours: envNum('MARKET_FOLLOW_HOURS', 24),
+            marketFollowIntervalMin: envNum('MARKET_FOLLOW_INTERVAL_MIN', 30),
+            marketFollowMaxPerCycle: envNum('MARKET_FOLLOW_MAX_PER_CYCLE', 4),
+            marketFollowMove: envNum('MARKET_FOLLOW_MOVE', 0.05),
+            marketFollowCooldownMin: envNum('MARKET_FOLLOW_COOLDOWN_MIN', 120),
         },
         push: {
             maxPerMinute: envLimit('MAX_ALERTS_PER_MIN', 6),

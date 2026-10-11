@@ -431,3 +431,100 @@ test('成交量突增：上一条成交量太低（元数据回填）不算放�
     const cur2 = snap({ volume24h: parseDec('9000'), observedAt: '2026-10-11T06:00:00.000Z' });
     assert.equal(detectAnomaly(prev2, cur2, RULES).candidates.some((c) => c.kind === 'volume_surge'), true, '真放量（$1.2k → $9k，7.5 倍）照报');
 });
+
+test('异动跟踪：继续同向走够门槛才再推；走不够只更新不推送；窗口结束就过期', async () => {
+    const app = mkApp({
+        config: { rules: { marketFollowHours: 24, marketFollowIntervalMin: 30, marketFollowMaxPerCycle: 5, marketFollowMove: 0.05 } },
+        // 盘口：买 0.38 / 卖 0.40 → 中间价 0.39（相对首次 0.30 继续上涨 +9 个点）
+        httpHandler: async (url) => {
+            if (url.includes('side=buy')) return { ok: true, data: { price: '0.38' }, status: 200, ms: 1, url };
+            if (url.includes('side=sell')) return { ok: true, data: { price: '0.40' }, status: 200, ms: 1, url };
+            return { ok: false, kind: 'http', error: '404', url, ms: 1 };
+        },
+    });
+    seedMarket(app.repos);
+    const an = app.repos.insertMarketAnomaly({
+        dedupeKey: 'ma:f1', conditionId: CID, tokenId: TOKEN, outcome: 'Yes', kind: 'price_move',
+        windowMinutes: 5, priceBefore: '0.24', priceAfter: '0.30', delta: '0.06',
+        bestBid: '0.29', bestAsk: '0.31', spread: '0.02', volume24h: '3000', liquidity: '4000',
+        change1h: null, change24h: null, priority: 'high', reason: 'r', dataQuality: 'verified',
+        ruleVersion: 'p1-rules-2', eventAt: '2026-10-11T06:00:00.000Z', observedAt: '2026-10-11T06:00:01.000Z',
+    });
+    const past = new Date(Date.now() - 60_000).toISOString();
+    const future = new Date(Date.now() + 24 * 3600_000).toISOString();
+    app.repos.addFollowup({ conditionId: CID, tokenId: TOKEN, anomalyId: an.id, kind: 'price_move', direction: 'up', basePrice: '0.30', nextCheckAt: past, followUntil: future });
+
+    const r = await app.pipeline.followDueMarkets();
+    assert.equal(r.checked, 1);
+    assert.equal(r.alerted, 1, '继续上涨 9 个点 ≥ 5 → 要推一条跟踪');
+    const row = app.repos.db.get("SELECT * FROM market_followups WHERE condition_id=?", CID);
+    assert.equal(Number(row.checks), 1);
+    assert.equal(row.last_price, '0.39');
+    const msg = app.sentMessages.length ? null : app.repos.db.get("SELECT payload FROM alert_outbox WHERE dedupe_key LIKE 'follow:%'");
+    assert.ok(msg, '跟踪消息要进队列');
+
+    // 走不够门槛：改成 0.31/0.32 → 中间价 0.315（+1.5 个点）→ 不推
+    const app2 = mkApp({
+        config: { rules: { marketFollowHours: 24, marketFollowIntervalMin: 30, marketFollowMaxPerCycle: 5, marketFollowMove: 0.05 } },
+        httpHandler: async (url) => ({ ok: true, data: { price: url.includes('side=buy') ? '0.31' : '0.32' }, status: 200, ms: 1, url }),
+    });
+    seedMarket(app2.repos);
+    const an2 = app2.repos.insertMarketAnomaly({
+        dedupeKey: 'ma:f2', conditionId: CID, tokenId: TOKEN, outcome: 'Yes', kind: 'price_move',
+        windowMinutes: 5, priceBefore: '0.29', priceAfter: '0.30', delta: '0.01',
+        bestBid: '0.29', bestAsk: '0.31', spread: '0.02', volume24h: '3000', liquidity: '4000',
+        change1h: null, change24h: null, priority: 'medium', reason: 'r', dataQuality: 'verified',
+        ruleVersion: 'p1-rules-2', eventAt: '2026-10-11T06:00:00.000Z', observedAt: '2026-10-11T06:00:01.000Z',
+    });
+    app2.repos.addFollowup({ conditionId: CID, tokenId: TOKEN, anomalyId: an2.id, kind: 'price_move', direction: 'up', basePrice: '0.30', nextCheckAt: past, followUntil: future });
+    const r2 = await app2.pipeline.followDueMarkets();
+    assert.equal(r2.checked, 1);
+    assert.equal(r2.alerted, 0, '只走 1.5 个点，不够门槛，不推');
+    assert.equal(Number(app2.repos.db.get("SELECT checks FROM market_followups WHERE condition_id=?", CID).checks), 1, '但要记录复查过');
+
+    // 窗口结束 → 过期，不再复查
+    app2.repos.addFollowup({ conditionId: '0x' + 'c'.repeat(64), tokenId: TOKEN, anomalyId: an2.id + 1, kind: 'price_move', direction: 'up', basePrice: '0.30', nextCheckAt: past, followUntil: new Date(Date.now() - 3600_000).toISOString() });
+    const r3 = await app2.pipeline.followDueMarkets();
+    assert.ok(r3.expired >= 1, '跟踪窗口结束要标记过期');
+    app.close(); app2.close();
+});
+
+test('首次异动消息里写明「已加入跟踪」', () => {
+    const app = mkApp();
+    seedMarket(app.repos);
+    const rec = app.repos.insertMarketAnomaly({
+        dedupeKey: 'ma:fn:1', conditionId: CID, tokenId: TOKEN, outcome: 'Yes', kind: 'price_move',
+        windowMinutes: 5, priceBefore: '0.24', priceAfter: '0.30', delta: '0.06',
+        bestBid: '0.29', bestAsk: '0.31', spread: '0.02', volume24h: '3000', liquidity: '4000',
+        change1h: null, change24h: null, priority: 'high', reason: 'r', dataQuality: 'verified',
+        ruleVersion: 'p1-rules-2', eventAt: '2026-10-11T06:00:00.000Z', observedAt: '2026-10-11T06:00:01.000Z',
+    });
+    const row = app.repos.db.get('SELECT * FROM market_anomalies WHERE id=?', rec.id);
+    const body = new Reports(app.repos, app.cfg).marketAnomalyReport(row, { followNote: '已加入跟踪：每 30 分钟复查盘口与成交，跟踪 24 小时；只有继续上涨 5 个点以上才会再推。' }).body;
+    assert.match(body, /🔁 已加入跟踪：每 30 分钟复查/);
+    app.close();
+});
+
+test('跟踪基准价按 kind 取：成交量异动不能用「成交量」当基准（会算出 -9657 的假方向）', async () => {
+    const app = mkApp({
+        config: { rules: { marketFollowHours: 24, marketFollowIntervalMin: 30, marketFollowMaxPerCycle: 5, marketFollowMove: 0.05 } },
+        httpHandler: async (url) => ({ ok: true, data: { price: url.includes('side=buy') ? '0.20' : '0.22' }, status: 200, ms: 1, url }),
+    });
+    seedMarket(app.repos);
+    // 该市场在异动时刻有一条观察价 0.20（作为基准）
+    app.repos.insertMarketObservation({ conditionId: CID, tokenId: TOKEN, price: '0.20', volume24h: '1200', liquidity: '9000', observedAt: '2026-10-11T05:59:00.000Z' });
+    const an = app.repos.insertMarketAnomaly({
+        dedupeKey: 'ma:vs:1', conditionId: CID, tokenId: TOKEN, outcome: 'Yes', kind: 'volume_surge',
+        windowMinutes: 10, priceBefore: '12', priceAfter: '57122', delta: null,
+        bestBid: '0.19', bestAsk: '0.21', spread: '0.02', volume24h: '57122', liquidity: '9000',
+        change1h: null, change24h: null, priority: 'high', reason: '放量', dataQuality: 'verified',
+        ruleVersion: 'p1-rules-2', eventAt: '2026-10-11T06:00:00.000Z', observedAt: '2026-10-11T06:00:01.000Z',
+    });
+    const past = new Date(Date.now() - 60_000).toISOString();
+    app.repos.addFollowup({ conditionId: CID, tokenId: TOKEN, anomalyId: an.id, kind: 'volume_surge', direction: 'either', basePrice: '0.20', nextCheckAt: past, followUntil: new Date(Date.now() + 86400_000).toISOString() });
+    const r = await app.pipeline.followDueMarkets();
+    assert.equal(r.checked, 1);
+    // 盘口中间价 0.21，相对基准 0.20 = +1 个点 < 5 → 不推（关键：不会因为把成交量当基准而报出 -9657 的假方向）
+    assert.equal(r.alerted, 0);
+    app.close();
+});

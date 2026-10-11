@@ -643,6 +643,49 @@ export class Repos {
         return this.db.all('SELECT * FROM market_anomalies WHERE condition_id=? AND event_at >= ? ORDER BY event_at DESC LIMIT ?', conditionId, since, limit);
     }
 
+    // ---------- 异动跟踪队列 ----------
+
+    /** 异动报警后登记跟踪（同一异动幂等） */
+    addFollowup(f: { conditionId: string; tokenId: string | null; anomalyId: number; kind: string; direction: string; basePrice: string | null; followUntil: string; nextCheckAt: string; now?: string }): void {
+        this.db.run(
+            `INSERT INTO market_followups(condition_id, token_id, anomaly_id, kind, direction, base_price, created_at, next_check_at, follow_until, state)
+             VALUES (?,?,?,?,?,?,?,?,?, 'active')
+             ON CONFLICT(condition_id, anomaly_id) DO NOTHING`,
+            f.conditionId, f.tokenId, f.anomalyId, f.kind, f.direction, f.basePrice, f.now ?? nowIso(), f.nextCheckAt, f.followUntil,
+        );
+    }
+
+    dueFollowups(now: string, limit: number): Row[] {
+        return this.db.all(
+            `SELECT * FROM market_followups WHERE state='active' AND next_check_at <= ? ORDER BY next_check_at ASC LIMIT ?`,
+            now, limit,
+        );
+    }
+
+    updateFollowup(id: number, patch: { lastPrice?: string | null; lastCheckAt?: string | null; checks?: number; nextCheckAt?: string; state?: string }): void {
+        const cur = this.db.get<Row>('SELECT * FROM market_followups WHERE id=?', id);
+        if (!cur) return;
+        this.db.run(
+            `UPDATE market_followups SET last_price=?, last_check_at=?, checks=?, next_check_at=?, state=? WHERE id=?`,
+            patch.lastPrice ?? (cur.last_price as string | null), patch.lastCheckAt ?? (cur.last_check_at as string | null),
+            patch.checks ?? Number(cur.checks), patch.nextCheckAt ?? String(cur.next_check_at), patch.state ?? String(cur.state), id,
+        );
+    }
+
+    /** 过期清理：跟踪窗口结束的标记为 expired（保留记录，便于回看当时跟踪了什么） */
+    expireFollowups(now: string): number {
+        return this.db.run(`UPDATE market_followups SET state='expired' WHERE state='active' AND follow_until <= ?`, now).changes;
+    }
+
+    followupStats(): { active: number; expired: number; due: number } {
+        const now = nowIso();
+        return {
+            active: this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM market_followups WHERE state='active'`)?.n ?? 0,
+            expired: this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM market_followups WHERE state='expired'`)?.n ?? 0,
+            due: this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM market_followups WHERE state='active' AND next_check_at <= ?`, now)?.n ?? 0,
+        };
+    }
+
     anomalyCount(): number { return this.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM market_anomalies')?.n ?? 0; }
 
     // ---------- 手动关注的市场 ----------

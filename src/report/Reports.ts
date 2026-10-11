@@ -104,7 +104,7 @@ export class Reports {
     // ---------- 市场异动（首要信号） ----------
 
     static readonly ANOMALY_LABEL: Record<string, string> = {
-        price_move: '价格异动', spread_widen: '盘口走阔', volume_surge: '成交量突增',
+        price_move: '价格异动', spread_widen: '盘口走阔', volume_surge: '成交量突增', follow_up: '异动跟踪',
     };
 
     /** 涨=🟢 跌=🔴（绿涨红跌） */
@@ -116,8 +116,8 @@ export class Reports {
     static kindEmoji(kind: string, delta: number | null): string {
         if (kind === 'spread_widen') return '📊';
         if (kind === 'volume_surge') return '🔥';
-        if (delta === null) return '⚪';
-        return delta > 0 ? '🟢📈' : delta < 0 ? '🔴📉' : '⚪';
+        const dir = delta === null ? '⚪' : delta > 0 ? '🟢📈' : delta < 0 ? '🔴📉' : '⚪';
+        return kind === 'follow_up' ? `🔁${dir}` : dir;
     }
 
     static ratioEmoji(v: number | null): string {
@@ -159,7 +159,7 @@ export class Reports {
      * 市场异动报告：一眼看到「涨还是跌 / 现价 / 盘口 / 谁在动（含画像分）」。
      * 事件时间与规则版本不再展示（用户要求）；但数据不完整时仍显式标注，不假装完整。
      */
-    marketAnomalyReport(a: MarketAnomalyRow, opts: { movers?: { wallet: string; buy: string; sell: string; trades: number }[]; moverNote?: string; shadow?: boolean } = {}): { title: string; body: string } {
+    marketAnomalyReport(a: MarketAnomalyRow, opts: { movers?: { wallet: string; buy: string; sell: string; trades: number }[]; moverNote?: string; showMoverHeader?: boolean; followNote?: string; shadow?: boolean } = {}): { title: string; body: string } {
         const market = this.repos.market(a.condition_id);
         const question = String(market?.question ?? `condition ${a.condition_id.slice(0, 12)}…`);
         const url = this.marketUrl(market);
@@ -174,7 +174,7 @@ export class Reports {
         //   price_move   → price_before/after 是价格
         //   spread_widen → price_before 是上一条买一、price_after 是当前买一，delta 是当前价差
         //   volume_surge → price_before/after 是 24h 成交量（不是价格！此前被当「现价」显示成 9658.29）
-        if (a.kind === 'price_move' && a.price_after) {
+        if ((a.kind === 'price_move' || a.kind === 'follow_up') && a.price_after) {
             const tail = a.price_before
                 ? ` ${Reports.arrow(delta)} ${Reports.signedPctPoints(delta ?? 0)}（${a.window_minutes} 分钟 ${fmtQty(a.price_before)} → ${fmtQty(a.price_after)}）`
                 : (a.outcome ? `（结果 ${escapeHtml(a.outcome)}）` : '');
@@ -212,11 +212,14 @@ export class Reports {
         if (opts.movers?.length) {
             lines.push(`👀 <b>谁在动</b>${opts.moverNote ?? '（该市场最近已获取的成交，非全市场）'}`);
             for (const m of opts.movers) for (const l of this.walletMoverLines(m)) lines.push(l);
+        } else if (opts.moverNote) {
+            lines.push(`👀 谁在动：${opts.moverNote.replace(/^（|）$/g, '')}`);
         } else {
             lines.push('👀 谁在动：未取到该市场的成交流水（这是缺口，不是「没人交易」）');
         }
         lines.push('');
 
+        if (opts.followNote) lines.push(`🔁 ${opts.followNote}`);
         if (url) lines.push(this.link('打开 Polymarket 市场页', url));
         else lines.push('🔗 市场页链接未取到（缺 slug，不伪造链接）');
         if (a.data_quality !== 'verified') lines.push(`⚠️ 数据完整度：${qualityLabel(a.data_quality)}`);
